@@ -12,6 +12,8 @@ export interface Preferences {
   thinkingGlowEnabled?: boolean;
   thinkingGlowColor?: string;
   videoPreviewResolution?: PreviewResolution;
+  /** 对话栏常驻：为真时不再因鼠标离开而自动收起 */
+  composerAlwaysVisible?: boolean;
 }
 export const preferenceKey = 'mewu.interface.v1';
 export function readPreferences(): Preferences {
@@ -28,6 +30,7 @@ export function readPreferences(): Preferences {
       showButtonLabels: value.showButtonLabels !== false,
       thinkingGlowEnabled: value.thinkingGlowEnabled !== false,
       videoPreviewResolution: [50, 75, 100].includes(value.videoPreviewResolution) ? value.videoPreviewResolution : 100,
+      composerAlwaysVisible: value.composerAlwaysVisible === true,
       thinkingGlowColor: typeof value.thinkingGlowColor === 'string' && /^#[0-9a-f]{6}$/i.test(value.thinkingGlowColor.trim()) ? value.thinkingGlowColor.trim().toUpperCase() : defaults.thinkingGlowColor,
     };
   } catch { return defaults; }

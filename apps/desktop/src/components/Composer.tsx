@@ -21,7 +21,7 @@ import '../conversation.css';
 interface Props {
   scene: Scene; agents: AgentProfile[]; connections: ConnectionProfile[]; draft: string; refs: Reference[];
   stream?: { runId: string; text: string; reasoning?: string }; expanded: boolean; error?: string; sending: boolean; closing: boolean;
-  position?: { x: number; y: number }; selectionActive: boolean; focusRequest: number;
+  position?: { x: number; y: number }; selectionActive: boolean; focusRequest: number; alwaysVisible?: boolean;
   onPosition: (position?: { x: number; y: number }) => void;
   onDraft: (text: string) => void; onSend: () => void; onCancel: () => void; onImport: () => void;
   onFreeze: () => void; onNew: () => void; onCapture: () => void; onClose: () => void; onSessions: () => void;
@@ -83,7 +83,7 @@ export default function Composer(props: Props) {
   const hasResponse = () => Boolean(latest() || currentReasoning() || running() || interrupted() || props.scene.run?.steps?.length);
   const historyVisible = createMemo(() => hasResponse() || Boolean(currentPrompt()) || (props.expanded && props.scene.messages.length > 0));
   const cancelHide = () => { if (hideTimer !== undefined) clearTimeout(hideTimer); hideTimer = undefined; };
-  const hideBlocked = () => Boolean(position() || dragging() || picker() || voiceMenu() || props.voice?.pending || composing || pointerHeld || focusAnchor || props.closing);
+  const hideBlocked = () => Boolean(props.alwaysVisible || position() || dragging() || picker() || voiceMenu() || props.voice?.pending || composing || pointerHeld || focusAnchor || props.closing);
   const pointerInDock = () => {
     if (!shell || pointerOutsideWindow) return false;
     const bounds = shell.getBoundingClientRect(), { x, y } = lastPointer;
@@ -142,7 +142,8 @@ export default function Composer(props: Props) {
     onCleanup(observeConversationTail(host, atEnd));
   });
   createEffect(on(() => props.focusRequest, () => { focusAnchor = { ...lastPointer }; reveal(true); }));
-  createEffect(() => { if (props.selectionActive && !position()) { focusVersion++; cancelHide(); setHidden(true); focusAnchor = undefined; input?.blur(); } });
+  createEffect(() => { if (props.selectionActive && !position() && !props.alwaysVisible) { focusVersion++; cancelHide(); setHidden(true); focusAnchor = undefined; input?.blur(); } });
+  createEffect(() => { if (props.alwaysVisible && hidden()) { cancelHide(); setHidden(false); } }); // 常驻：任何路径造成的隐藏都立即恢复
   createEffect(() => {
     const text = latest(), count = props.scene.messages.length, expanded = props.expanded;
     if (atEnd()) queueMicrotask(() => { if (history && atEnd()) history.scrollTop = history.scrollHeight; });
