@@ -235,7 +235,7 @@ export default function SpaceCanvas(props: Props) {
   const [pluginMenu, setPluginMenu] = createSignal<'workflow' | 'ocr' | 'scroll' | 'translation' | 'pin'>();
   const [pingWheel, setPingWheel] = createSignal<{ x: number; y: number } | null>(null);
   const [pingSlot, setPingSlot] = createSignal(-1);
-  const [pingMarker, setPingMarker] = createSignal<{ x: number; y: number; icon: string | undefined; label: string; color: string; id: number } | null>(null);
+  const [pingMarker, setPingMarker] = createSignal<{ x: number; y: number; icon: string | undefined; art2: string | undefined; fx: string | undefined; label: string; color: string; id: number } | null>(null);
   let pingArmed = false; // 触发键被扣住：按住期间不输入到任何输入框
   let pingPending: { x: number; y: number } | null = null; // LOL 模式：左键已按下、尚未拖过阈值
   let pingMarkerTimer: number | undefined;
@@ -551,7 +551,7 @@ export default function SpaceCanvas(props: Props) {
     const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
     const workflow = workflowEntryFor(slot.action);
     const skinEntry = slot.skin ? PING_SKINS[slot.skin] : undefined;
-    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon ?? (skinEntry?.icon || undefined), art: skinEntry?.art || undefined, voice: skinEntry?.voice || undefined, color: skinEntry?.color, index };
+    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon ?? (skinEntry?.icon || undefined), art: skinEntry?.art || undefined, art2: skinEntry?.art2, fx: skinEntry?.fx, voice: skinEntry?.voice || undefined, color: skinEntry?.color, index };
   });
   function pingCancel() {
     pingPending = null;
@@ -607,9 +607,9 @@ export default function SpaceCanvas(props: Props) {
     firePingAt(wheel.x, wheel.y, slotIndex);
   }
   // LOL 模式的 ping 标记：三层扩散环 + 弹跳图标 + 地面光晕（颜色按方位），约 3.2s 后消失
-  function spawnPingMarker(x: number, y: number, slot: { action: string; icon?: string; art?: string; voice?: string; label: string; color?: string }, slotIndex: number) {
+  function spawnPingMarker(x: number, y: number, slot: { action: string; icon?: string; art?: string; art2?: string; fx?: string; voice?: string; label: string; color?: string }, slotIndex: number) {
     playPingAudio(slot.voice || PING_VOICES[slot.action], 0.5); // 第二层：标记生成时的语音音效（皮肤优先）
-    setPingMarker({ x, y, icon: slot.icon ?? slot.art ?? PING_MARKER_ART[slot.action] ?? PING_WHEEL_ICONS[slot.action], label: slot.label, color: slot.color ?? PING_WHEEL_SLOT_COLORS[slotIndex] ?? '#f2c518', id: Date.now() });
+    setPingMarker({ x, y, icon: slot.icon ?? slot.art ?? PING_MARKER_ART[slot.action] ?? PING_WHEEL_ICONS[slot.action], art2: slot.art2, fx: slot.fx, label: slot.label, color: slot.color ?? PING_WHEEL_SLOT_COLORS[slotIndex] ?? '#f2c518', id: Date.now() });
     if (pingMarkerTimer !== undefined) clearTimeout(pingMarkerTimer);
     pingMarkerTimer = window.setTimeout(() => { pingMarkerTimer = undefined; setPingMarker(null); }, 3300);
   }
@@ -1178,8 +1178,12 @@ export default function SpaceCanvas(props: Props) {
     <Show when={pingMarker()} keyed>{m => (
       <div class="ping-fx" style={`left:${m.x}px; top:${m.y}px; --c:${m.color}; --size:110px; --dur:3.2s;`} aria-hidden="true">
         <div class="pf-ground" /><div class="pf-ring" /><div class="pf-ring pf-r2" /><div class="pf-ring pf-r3" />
-        <div class="pf-art">
-          <Show when={m.icon} keyed fallback={<span class="pf-emoji">{m.label}</span>}>{url => <img src={url} alt="" />}</Show>
+        <div class="pf-art" classList={{ [`pf-fx-${m.fx}`]: Boolean(m.fx) }}>
+          {m.art2 && m.icon
+            ? <><div class="pf-clash"><img class="pf-a1" src={m.icon} alt="" /><img class="pf-a2" src={m.art2} alt="" /></div><div class="pf-flash-burst" /></>
+            : m.icon
+              ? <img src={m.icon} alt="" />
+              : <span class="pf-emoji">{m.label}</span>}
         </div>
       </div>
     )}</Show>
