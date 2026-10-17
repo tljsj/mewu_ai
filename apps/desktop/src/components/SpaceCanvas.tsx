@@ -536,10 +536,10 @@ export default function SpaceCanvas(props: Props) {
     return workflowEntries().find(item => item.plugin.manifest.id === manifestId && item.contribution.id === contributionId);
   };
   const pingSlots = () => (props.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS_FALLBACK).map((slot, index) => {
-    if (slot.action === 'none') return { label: '', title: '', action: slot.action, index };
+    if (slot.action === 'none') return { label: '', title: '', action: slot.action, icon: undefined as string | undefined, index };
     const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
     const workflow = workflowEntryFor(slot.action);
-    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, index };
+    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon, index };
   });
   function pingCancel() {
     setPingWheel(null);
@@ -1067,9 +1067,9 @@ export default function SpaceCanvas(props: Props) {
           <For each={pingSlots()}>{slot => (
             <path class="ping-wedge" classList={{ hot: pingSlot() === slot.index }} d={pingSector(PING_WHEEL_INNER, PING_WHEEL_OUTER, -112.5 + slot.index * 45, -67.5 + slot.index * 45)} />
           )}</For>
-          <For each={pingSlots()}>{slot => { const [ix, iy] = pingPolar(PING_WHEEL_ICON_R, -90 + slot.index * 45); return (
-            <text class="ping-wedge-icon" classList={{ hot: pingSlot() === slot.index }} x={ix} y={iy + 9}>{slot.label}</text>
-          ); }}</For>
+          <For each={pingSlots()}>{slot => { const [ix, iy] = pingPolar(PING_WHEEL_ICON_R, -90 + slot.index * 45); return slot.icon
+            ? <image class="ping-wedge-image" classList={{ hot: pingSlot() === slot.index }} href={slot.icon} x={ix - 20} y={iy - 20} width="40" height="40" />
+            : <text class="ping-wedge-icon" classList={{ hot: pingSlot() === slot.index }} x={ix} y={iy + 9}>{slot.label}</text>; }}</For>
           <circle class="ping-hub" r={PING_WHEEL_INNER - 8} />
           <text class="ping-hub-icon" y={6}>✕</text>
           <Show when={pingSlots()[pingSlot()]} keyed>{slot => { const [lx, ly] = pingPolar(PING_WHEEL_LABEL_R, -90 + slot.index * 45); return (

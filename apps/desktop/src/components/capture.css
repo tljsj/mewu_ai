@@ -53,3 +53,5 @@
 .ping-slice-title{fill:#f0e6d2;font:700 15px "Segoe UI",sans-serif;text-anchor:middle;paint-order:stroke;stroke:rgba(1,10,19,.9);stroke-width:4px}
 .ping-trigger-recording{border-color:#f0b429;color:#7a5b0e}
 .ping-slot-label{width:5.5em;margin-left:6px}
+.ping-wedge-image{filter:drop-shadow(0 0 4px rgba(0,0,0,.5));transition:transform .07s ease;transform-box:fill-box;transform-origin:center}
+.ping-wedge-image.hot{transform:scale(1.15)}

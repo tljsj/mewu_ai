@@ -91,10 +91,18 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
     <For each={Array.from({ length: 8 }, (_, index) => index)}>{index => {
       const slot = () => (props.preferences.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS)[index] ?? DEFAULT_PING_WHEEL_SLOTS[index];
       const builtin = () => PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot().action);
-      const editSlot = (patch: Partial<{ action: string; label: string }>) => {
+      const editSlot = (patch: Partial<{ action: string; label: string; icon?: string }>) => {
         const next = Array.from({ length: 8 }, (_, i) => (props.preferences.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS)[i] ?? DEFAULT_PING_WHEEL_SLOTS[i]);
-        next[index] = { action: patch.action ?? next[index].action, label: patch.label !== undefined ? patch.label : next[index].label };
+        next[index] = { action: patch.action ?? next[index].action, label: patch.label !== undefined ? patch.label : next[index].label, ...(patch.icon !== undefined ? { icon: patch.icon } : ('icon' in next[index] ? { icon: next[index].icon } : {})) };
         props.onPreferences({ ...props.preferences, pingWheelSlots: next });
+      };
+      let iconInput: HTMLInputElement | undefined;
+      const pickIcon = (file: File | undefined) => {
+        if (!file) return;
+        if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 200 * 1024) { props.onPreferences({ ...props.preferences }); return; } // 只收 ≤200KB 的 PNG/JPEG/WebP
+        const reader = new FileReader();
+        reader.onload = () => { if (typeof reader.result === 'string') editSlot({ icon: reader.result }); };
+        reader.readAsDataURL(file);
       };
       return <Row title={`${t('轮盘槽位')} · ${PING_WHEEL_DIRECTIONS[index]}`}>
         <select aria-label={`${t('轮盘槽位')} ${PING_WHEEL_DIRECTIONS[index]}`} value={slot().action} onChange={event => editSlot({ action: event.currentTarget.value })}>
@@ -103,6 +111,9 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
           <option value="none">{t('空')}</option>
         </select>
         <input aria-label={`${t('槽位图标')} ${PING_WHEEL_DIRECTIONS[index]}`} class="ping-slot-label" maxlength="8" placeholder={builtin()?.label ?? t('图标')} value={slot().label ?? ''} onInput={event => editSlot({ label: event.currentTarget.value })} />
+        <input ref={iconInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={event => { pickIcon(event.currentTarget.files?.[0]); event.currentTarget.value = ''; }} />
+        <button class="secondary-button" title={t('选择图片图标（≤200KB）')} onClick={() => iconInput?.click()}>{slot().icon ? t('换图') : t('图片')}</button>
+        <Show when={slot().icon}><button class="secondary-button" title={t('清除图片图标')} onClick={() => editSlot({ icon: '' })}>{t('清除')}</button></Show>
       </Row>;
     }}</For>
     <Row title={t("轮盘布局")}><button class="secondary-button" onClick={() => props.onPreferences({ ...props.preferences, pingWheelSlots: [...DEFAULT_PING_WHEEL_SLOTS] })}>{t('恢复默认布局')}</button></Row>
