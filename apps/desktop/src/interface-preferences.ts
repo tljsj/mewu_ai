@@ -60,7 +60,7 @@ export function readPreferences(): Preferences {
       thinkingGlowColor: typeof value.thinkingGlowColor === 'string' && /^#[0-9a-f]{6}$/i.test(value.thinkingGlowColor.trim()) ? value.thinkingGlowColor.trim().toUpperCase() : defaults.thinkingGlowColor,
       pingWheelTrigger: validTrigger(value.pingWheelTrigger) ? value.pingWheelTrigger : defaults.pingWheelTrigger,
       pingWheelSlots: validSlots(value.pingWheelSlots),
-      pingWheelMode: value.pingWheelMode === 'lol' ? 'lol' : 'click',
+      pingWheelMode: value.pingWheelMode === 'click' ? 'click' : 'lol', // 本分支默认 LOL 模式（PR 线的 ping-wheel 默认 click）
     };
   } catch { return defaults; }
 }
