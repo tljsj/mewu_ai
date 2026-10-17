@@ -15,6 +15,8 @@ import SystemCaptureShortcutSetting from './SystemCaptureShortcutSetting';
 import type { PreviewResolution } from '../video-preview';
 import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelTriggerPref } from '../interface-preferences';
 import { PING_WHEEL_BUILTIN_ACTIONS } from './SpaceCanvas';
+import { getPlugins, subscribePlugins } from '../plugin-bridge';
+import type { PluginRecord } from '../plugin-contracts';
 
 const PING_WHEEL_DIRECTIONS = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'] as const;
 const formatPingTrigger = (value: PingWheelTriggerPref) => [value.ctrl && 'Ctrl', value.shift && 'Shift', value.alt && 'Alt', value.code.replace(/^Key|^Digit/, '')].filter(Boolean).join(' + ');
@@ -42,6 +44,19 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
   const [view, setView] = createSignal<CapturePreferencesView>({ pending: false, conflict: false, error: '' });
   const [loading, setLoading] = createSignal(false);
   const controller = new CapturePreferencesController(api.saveCapturePreferences, setView);
+  const [workflowActions, setWorkflowActions] = createSignal<Array<{ action: string; title: string }>>([]);
+  const collectWorkflowActions = (plugins: PluginRecord[]) => setWorkflowActions(plugins
+    .filter(plugin => plugin.state === 'enabled' && !plugin.error)
+    .flatMap(plugin => plugin.manifest.contributions.filter(contribution => contribution.kind === 'selection.workflow')
+      .map(contribution => ({ action: `workflow:${plugin.manifest.id}/${contribution.id}`, title: contribution.title }))));
+  createEffect(on(() => props.active && pane() === 'screenshot', active => {
+    if (!active) return;
+    let stopSubscription: (() => void) | undefined;
+    let disposedEffect = false;
+    onCleanup(() => { disposedEffect = true; stopSubscription?.(); });
+    void getPlugins().then(snapshot => { if (!disposedEffect) collectWorkflowActions(snapshot.plugins); }).catch(() => {});
+    void subscribePlugins(snapshot => collectWorkflowActions(snapshot.plugins), 'settings').then(stop => { if (disposedEffect) stop(); else stopSubscription = stop; }).catch(() => {});
+  }));
   let disposed = false, stop: (() => void) | undefined, started = false;
   async function initialize() {
     if (loading() || disposed) return;
@@ -84,6 +99,7 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
       return <Row title={`${t('轮盘槽位')} · ${PING_WHEEL_DIRECTIONS[index]}`}>
         <select aria-label={`${t('轮盘槽位')} ${PING_WHEEL_DIRECTIONS[index]}`} value={slot().action} onChange={event => editSlot({ action: event.currentTarget.value })}>
           <For each={PING_WHEEL_BUILTIN_ACTIONS}>{entry => <option value={entry.action}>{t(entry.title)}</option>}</For>
+          <For each={workflowActions()}>{entry => <option value={entry.action}>{entry.title}</option>}</For>
           <option value="none">{t('空')}</option>
         </select>
         <input aria-label={`${t('槽位图标')} ${PING_WHEEL_DIRECTIONS[index]}`} class="ping-slot-label" maxlength="8" placeholder={builtin()?.label ?? t('图标')} value={slot().label ?? ''} onInput={event => editSlot({ label: event.currentTarget.value })} />
