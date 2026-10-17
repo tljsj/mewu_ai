@@ -45,8 +45,8 @@ import { OcrRequestGate, type OcrRequest } from '../ocr-request';
 import { sameOcrTarget } from '../ocr-selection';
 import { finishCapture } from '../capture-completion';
 import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelSlotPref, type PingWheelTriggerPref } from '../interface-preferences';
-import { playPingAudio, playPingSound } from '../ping-sound';
-import { PING_HUB_ICON, PING_MARKER_ART, PING_SKINS, PING_VOICES, PING_WHEEL_ICONS } from '../ping-assets';
+import { playPingAudio, playPingSound, preloadPingAudio } from '../ping-sound';
+import { PING_DEFAULT_SKIN_BY_ACTION, PING_HUB_ICON, PING_MARKER_ART, PING_SKINS, PING_VOICES, PING_WHEEL_ICONS, PING_SOUNDS_LIB } from '../ping-assets';
 import { regionImageProjection } from '../region-image';
 import { getWindowSnapMap } from '../window-snap-bridge';
 import { DrawingInputPhase, drawingDiagnosticsEnabled, recordDrawingInput } from '../drawing-diagnostics';
@@ -556,7 +556,7 @@ export default function SpaceCanvas(props: Props) {
     if (slot.action === 'none') return { label: '', title: '', action: slot.action, icon: undefined as string | undefined, index };
     const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
     const workflow = workflowEntryFor(slot.action);
-    const skinEntry = slot.skin ? PING_SKINS[slot.skin] : undefined;
+    const skinEntry = PING_SKINS[slot.skin ?? PING_DEFAULT_SKIN_BY_ACTION[slot.action]];
     return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon ?? (skinEntry?.icon || undefined), art: skinEntry?.art || undefined, art2: skinEntry?.art2, fx: skinEntry?.fx, voice: skinEntry?.voice || undefined, color: skinEntry?.color, index };
   });
   function pingCancel() {
@@ -565,6 +565,7 @@ export default function SpaceCanvas(props: Props) {
     setPingSlot(-1);
   }
   function openPingWheel(at?: { x: number; y: number }) {
+    preloadPingAudio(Object.values(PING_SOUNDS_LIB)); // 轮盘打开即预解码全部音效，松手触发零延迟
     const origin = at ?? lastPointer;
     const margin = pingWheelSize() / 2 + 14;
     const x = clamp(origin.x, margin, Math.max(margin, viewport().width - margin));
