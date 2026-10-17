@@ -536,9 +536,16 @@ export default function SpaceCanvas(props: Props) {
     const trigger = pingTrigger();
     return event.code === trigger.code && event.ctrlKey === trigger.ctrl && event.shiftKey === trigger.shift && event.altKey === trigger.alt && !event.metaKey;
   };
+  const workflowEntryFor = (action: string) => {
+    if (!action.startsWith('workflow:')) return undefined;
+    const [manifestId, contributionId] = action.slice('workflow:'.length).split('/');
+    return workflowEntries().find(item => item.plugin.manifest.id === manifestId && item.contribution.id === contributionId);
+  };
   const pingSlots = () => (props.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS_FALLBACK).map((slot, index) => {
+    if (slot.action === 'none') return { label: '', title: '', action: slot.action, index };
     const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
-    return { label: slot.label?.trim() || (builtin?.label ?? '▪'), title: builtin?.title ?? slot.action, action: slot.action, index };
+    const workflow = workflowEntryFor(slot.action);
+    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, index };
   });
   function pingCancel() {
     setPingWheel(null);
@@ -557,6 +564,8 @@ export default function SpaceCanvas(props: Props) {
   }
   function runPingSlot(slot: { action: string }, region: Region) {
     if (slot.action === 'cancel' || slot.action === 'none') return;
+    const workflow = workflowEntryFor(slot.action);
+    if (workflow) { runWorkflow(workflow, region); return; } // 插件工作流槽位：任何 selection.workflow 贡献都能上轮盘
     if (slot.action === 'explain') {
       const entry = workflowEntries().find(item => item.plugin.manifest.id === 'wsk.ask') ?? workflowEntries()[0];
       if (entry) runWorkflow(entry, region); else props.onError('没有可用的图像处理插件');
