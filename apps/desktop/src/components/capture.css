@@ -43,3 +43,15 @@
 .capture-toolbar>button.capture-referenced{background:#e9edff;border-color:#d8e0ff}
 .capture-toolbar>button.capture-delete{color:#ce6371}
 .capture-toolbar .capture-separator{flex:0 0 1px;width:1px;height:22px;background:#dce4ef;margin:0 3px}
+.ping-wheel{position:fixed;z-index:60;pointer-events:none}
+.ping-wedge{fill:rgba(1,10,19,.82);stroke:#785a28;stroke-width:1.5;transition:fill .06s ease}
+.ping-wedge.hot{fill:rgba(240,180,41,.92);stroke:#c8aa6e}
+.ping-wedge-icon{fill:#cdbe91;font:700 26px "Segoe UI Emoji","Segoe UI",sans-serif;text-anchor:middle;pointer-events:none}
+.ping-wedge-icon.hot{fill:#0a1428}
+.ping-hub{fill:rgba(1,10,19,.85);stroke:#785a28;stroke-width:1.5}
+.ping-hub-icon{fill:#785a28;font:700 16px "Segoe UI",sans-serif;text-anchor:middle}
+.ping-slice-title{fill:#f0e6d2;font:700 15px "Segoe UI",sans-serif;text-anchor:middle;paint-order:stroke;stroke:rgba(1,10,19,.9);stroke-width:4px}
+.ping-trigger-recording{border-color:#f0b429;color:#7a5b0e}
+.ping-slot-label{width:5.5em;margin-left:6px}
+.ping-wedge-image{filter:drop-shadow(0 0 4px rgba(0,0,0,.5));transition:transform .07s ease;transform-box:fill-box;transform-origin:center}
+.ping-wedge-image.hot{transform:scale(1.15)}
