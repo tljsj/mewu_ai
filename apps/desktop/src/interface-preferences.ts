@@ -37,6 +37,10 @@ export interface Preferences {
   thinkingGlowEnabled?: boolean;
   thinkingGlowColor?: string;
   videoPreviewResolution?: PreviewResolution;
+  pingWheelTrigger?: PingWheelTriggerPref;
+  pingWheelSlots?: PingWheelSlotPref[];
+  /** click = 按住键唤出+点击槽位（默认，无素材）；lol = 长按左键拖动松手触发+标记动画+贴图主题（素材可本地注入） */
+  pingWheelMode?: 'click' | 'lol';
   /** 对话栏常驻：为真时不再因鼠标离开而自动收起 */
   composerAlwaysVisible?: boolean;
 }
@@ -55,11 +59,11 @@ export function readPreferences(): Preferences {
       showButtonLabels: value.showButtonLabels !== false,
       thinkingGlowEnabled: value.thinkingGlowEnabled !== false,
       videoPreviewResolution: [50, 75, 100].includes(value.videoPreviewResolution) ? value.videoPreviewResolution : 100,
-      composerAlwaysVisible: value.composerAlwaysVisible === true,
       thinkingGlowColor: typeof value.thinkingGlowColor === 'string' && /^#[0-9a-f]{6}$/i.test(value.thinkingGlowColor.trim()) ? value.thinkingGlowColor.trim().toUpperCase() : defaults.thinkingGlowColor,
       pingWheelTrigger: validTrigger(value.pingWheelTrigger) ? value.pingWheelTrigger : defaults.pingWheelTrigger,
       pingWheelSlots: validSlots(value.pingWheelSlots),
       pingWheelMode: value.pingWheelMode === 'lol' ? 'lol' : 'click',
+      composerAlwaysVisible: value.composerAlwaysVisible === true,
     };
   } catch { return defaults; }
 }
