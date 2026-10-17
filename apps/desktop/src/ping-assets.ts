@@ -55,6 +55,18 @@ export const PING_MARKER_ART: Record<string, string> = pick(PING_MARKER_ART_NAME
 export const PING_VOICES: Record<string, string> = pick(PING_VOICE_NAMES, PING_SOUNDS_LIB);
 export const PING_HUB_ICON: string = PING_TEXTURES['generic_ping'] ?? '';
 
+// 默认动作 → 皮肤：没选皮肤的槽位也按这套获得符号/语音/动效（解释=通用、保存=推进……）
+export const PING_DEFAULT_SKIN_BY_ACTION: Record<string, string> = {
+  explain: 'generic',
+  pin: 'target',
+  copy: 'visioncleared',
+  save: 'push',
+  cancel: 'danger',
+  ocr: 'enemyvision',
+  translate: 'bait',
+  table: 'allin',
+};
+
 // 皮肤（LOL ping 预设）：一个皮肤同时确定 轮盘图标 + 落点符号 + 语音 + 颜色。
 // 对应 lolPing 的 ALL_PINGS，另加 target/caution 两个补充皮肤。公开版本库为空时全部字段为空串（退化为默认样式）。
 export interface PingSkin { name: string; icon: string; art: string; art2?: string; voice: string; color: string; fx?: 'spin' | 'drop' | 'flash' | 'swing' }
