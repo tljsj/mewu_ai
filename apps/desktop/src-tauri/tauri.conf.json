@@ -76,7 +76,7 @@
   "mainBinaryName": "MewuAI",
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAyQkRGNDMyOUNEMDYwOTEKUldTUllOQ2NNdlM5QWl0a2NpMER5cURVNkk0Y2NIS3h1WkZ4WXZnT0NBYyszaDdQa05ZRVI2dlQK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDBCRUY0MjU2NUU1MTg0NTgKUldSWWhGRmVWa0x2QzVrWGF3TDFTdUJ5UGtqazd6MytydlBVb1MxeWRqRkZvdnN3WHZBbzRDSUIK",
       "endpoints": [
         "https://api.github.com/repos/tljsj/mewu_ai/releases/latest"
       ],
