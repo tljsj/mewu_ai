@@ -45,6 +45,8 @@ import { OcrRequestGate, type OcrRequest } from '../ocr-request';
 import { sameOcrTarget } from '../ocr-selection';
 import { finishCapture } from '../capture-completion';
 import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelSlotPref, type PingWheelTriggerPref } from '../interface-preferences';
+import { playPingAudio, playPingSound } from '../ping-sound';
+import { PING_HUB_ICON, PING_VOICES, PING_WHEEL_ICONS } from '../ping-assets';
 import { regionImageProjection } from '../region-image';
 import { getWindowSnapMap } from '../window-snap-bridge';
 import { DrawingInputPhase, drawingDiagnosticsEnabled, recordDrawingInput } from '../drawing-diagnostics';
@@ -112,6 +114,7 @@ interface Props {
   maskOpacity: number;
   pingWheelTrigger?: PingWheelTriggerPref;
   pingWheelSlots?: readonly PingWheelSlotPref[];
+  pingWheelMode?: 'click' | 'lol';
 }
 interface Box { x: number; y: number; width: number; height: number }
 interface PendingSelection { sceneId: string; backgroundId: string; region: Region; version: number; automatic?: SnapNode; complete: boolean; acknowledged?: boolean; presented?: boolean }
@@ -133,7 +136,8 @@ export const PING_WHEEL_BUILTIN_ACTIONS: ReadonlyArray<{ action: string; title: 
   { action: 'table', title: '表格', label: '▦' },
 ];
 const DEFAULT_PING_WHEEL_SLOTS_FALLBACK = DEFAULT_PING_WHEEL_SLOTS;
-const PING_WHEEL_SIZE = 440, PING_WHEEL_INNER = 62, PING_WHEEL_OUTER = 152, PING_WHEEL_ICON_R = 107, PING_WHEEL_LABEL_R = 196;
+const PING_WHEEL_SLOT_COLORS: ReadonlyArray<string> = ['#f2c518', '#56d43c', '#2b80ff', '#35d27a', '#ff3b55', '#ff3b55', '#efbc12', '#f2b320'];
+const PING_WHEEL_SIZE = 440, PING_WHEEL_LOL_SIZE = 540, PING_WHEEL_INNER = 62, PING_WHEEL_OUTER = 152, PING_WHEEL_EXT = 233, PING_WHEEL_ICON_R = 107, PING_WHEEL_ICON_SIZE = 39, PING_WHEEL_LABEL_R = 196, PING_DRAG_THRESHOLD = 10;
 const pingPolar = (r: number, deg: number): [number, number] => [r * Math.cos((deg * Math.PI) / 180), r * Math.sin((deg * Math.PI) / 180)];
 function pingSector(r0: number, r1: number, a0: number, a1: number): string {
   const [x0, y0] = pingPolar(r0, a0), [x1, y1] = pingPolar(r1, a0), [x2, y2] = pingPolar(r1, a1), [x3, y3] = pingPolar(r0, a1);
@@ -232,8 +236,13 @@ export default function SpaceCanvas(props: Props) {
   const [pluginMenu, setPluginMenu] = createSignal<'workflow' | 'ocr' | 'scroll' | 'translation' | 'pin'>();
   const [pingWheel, setPingWheel] = createSignal<{ x: number; y: number } | null>(null);
   const [pingSlot, setPingSlot] = createSignal(-1);
+  const [pingMarker, setPingMarker] = createSignal<{ x: number; y: number; icon: string | undefined; label: string; color: string; id: number } | null>(null);
   let pingArmed = false; // 触发键被扣住：按住期间不输入到任何输入框
+  let pingPending: { x: number; y: number } | null = null; // LOL 模式：左键已按下、尚未拖过阈值
+  let pingMarkerTimer: number | undefined;
   let lastPointer = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+  const pingLol = () => (props.pingWheelMode ?? 'click') === 'lol';
+  const pingWheelSize = () => pingLol() ? PING_WHEEL_LOL_SIZE : PING_WHEEL_SIZE;
   const [extensionButtonCount, setExtensionButtonCount] = createSignal(0);
   const [extensionInteracting, setExtensionInteracting] = createSignal(false), [extensionRunning, setExtensionRunning] = createSignal(false);
   const [scrollMenuManual, setScrollMenuManual] = createSignal(false);
@@ -455,7 +464,8 @@ export default function SpaceCanvas(props: Props) {
   }
   function hover(event: PointerEvent) {
     lastPointer = { x: event.clientX, y: event.clientY };
-    if (pingWheel()) { setPingSlot(pingPickSlice(event.clientX - pingWheel()!.x, event.clientY - pingWheel()!.y)); return; }
+    if (pingWheel()) { if (!pingLol()) setPingSlot(pingPickSlice(event.clientX - pingWheel()!.x, event.clientY - pingWheel()!.y)); return; } // LOL 模式的切片由捕获层指针跟踪更新
+    if (pingArmed && pingLol()) return;
     if (extensionInteracting()) { clearHideTimer(); return; }
     if (event.target instanceof Element && event.target.closest('.selection-code-card')) { clearSnapPreview(); clearHideTimer(); return; }
     updateSnapPreview({ x: event.clientX, y: event.clientY, shiftKey: event.shiftKey });
@@ -549,13 +559,15 @@ export default function SpaceCanvas(props: Props) {
     return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon, index };
   });
   function pingCancel() {
+    pingPending = null;
     setPingWheel(null);
     setPingSlot(-1);
   }
-  function openPingWheel() {
-    const margin = PING_WHEEL_OUTER + 30;
-    const x = clamp(lastPointer.x, margin, Math.max(margin, viewport().width - margin));
-    const y = clamp(lastPointer.y, margin, Math.max(margin, viewport().height - margin));
+  function openPingWheel(at?: { x: number; y: number }) {
+    const origin = at ?? lastPointer;
+    const margin = pingWheelSize() / 2 + 14;
+    const x = clamp(origin.x, margin, Math.max(margin, viewport().width - margin));
+    const y = clamp(origin.y, margin, Math.max(margin, viewport().height - margin));
     setPingSlot(-1);
     setPingWheel({ x, y });
   }
@@ -583,17 +595,28 @@ export default function SpaceCanvas(props: Props) {
     } else if (slot.action === 'copy') void exportRegion(region, true, false);
     else if (slot.action === 'save') void exportRegion(region, false, false);
   }
+  function firePingAt(x: number, y: number, slotIndex: number) {
+    const slot = pingSlots()[slotIndex];
+    if (!slot || slot.action === 'cancel' || slot.action === 'none') return; // 中心死区/取消槽=关闭
+    const region = regionAt(x, y) ?? activeRegion();
+    if (!region) { props.onError('ping 的位置没有选区，先框选一块内容'); return; }
+    if (pingLol()) spawnPingMarker(x, y, slot, slotIndex);
+    setActive(region.id);
+    runPingSlot(slot, region);
+  }
   function firePingFromClick(x: number, y: number) {
     const wheel = pingWheel();
     if (!wheel) return;
     const slotIndex = pingPickSlice(x - wheel.x, y - wheel.y);
-    const slot = slotIndex >= 0 ? pingSlots()[slotIndex] : undefined;
     pingCancel();
-    if (!slot || slot.action === 'cancel' || slot.action === 'none') return; // 点击中心/取消槽=关闭
-    const region = regionAt(wheel.x, wheel.y) ?? activeRegion();
-    if (!region) { props.onError('ping 的位置没有选区，先框选一块内容'); return; }
-    setActive(region.id);
-    runPingSlot(slot, region);
+    firePingAt(wheel.x, wheel.y, slotIndex);
+  }
+  // LOL 模式的 ping 标记：三层扩散环 + 弹跳图标 + 地面光晕（颜色按方位），约 3.2s 后消失
+  function spawnPingMarker(x: number, y: number, slot: { action: string; icon?: string; label: string }, slotIndex: number) {
+    playPingAudio(PING_VOICES[slot.action], 0.5); // 第二层：标记生成时的语音音效
+    setPingMarker({ x, y, icon: slot.icon ?? PING_WHEEL_ICONS[slot.action], label: slot.label, color: PING_WHEEL_SLOT_COLORS[slotIndex] ?? '#f2c518', id: Date.now() });
+    if (pingMarkerTimer !== undefined) clearTimeout(pingMarkerTimer);
+    pingMarkerTimer = window.setTimeout(() => { pingMarkerTimer = undefined; setPingMarker(null); }, 3300);
   }
   function trackPointer(event: PointerEvent, move: (event: PointerEvent) => void, finish: (committed: boolean) => void, sourceCurrent?: () => boolean, preservePendingOutlines = false) {
     ocrRequests.cancel(); props.onTranslationCancel?.(); cancelGesture?.(); event.preventDefault(); event.stopPropagation();
@@ -622,7 +645,7 @@ export default function SpaceCanvas(props: Props) {
   }
   function begin(event: PointerEvent) {
     if (props.blackboard) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 5); return; }
-    if (pingWheel()) return; // 轮盘打开时不进入框选
+    if (pingWheel() || pingArmed) return; // ping 手势期间不进入框选
     if (event.button !== 0) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 1); return; }
     if (activity()) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 2); return; }
     if (!props.scene.background || backgroundError() || !geometry().width) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 4); return; }
@@ -802,7 +825,7 @@ export default function SpaceCanvas(props: Props) {
       if ((bareModifier || !target?.closest('input,textarea,select,.artifact-card,.ocr-text-layer,.drawing-editor,[contenteditable]:not([contenteditable="false"])')) && !document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]') && props.scene.background && !backgroundError() && !drawingSession()) {
         pingArmed = true;
         event.preventDefault(); event.stopImmediatePropagation();
-        openPingWheel();
+        if (!pingLol()) openPingWheel(); // LOL 模式按住不立即开轮盘，等左键拖动
       }
     } else if (pingArmed && (event.code === pingTrigger().code || event.key === pingTrigger().code)) { // 扣住：按住期间的重复按键不得输入
       event.preventDefault(); event.stopImmediatePropagation();
@@ -861,11 +884,40 @@ export default function SpaceCanvas(props: Props) {
     if (pingArmed && pingTriggerMatchesEvent(event)) { pingArmed = false; pingCancel(); } // 松开触发键 = 关闭轮盘
   };
   const pingPointerDown = (event: PointerEvent) => {
+    if (pingLol()) { // LOL 模式：按住触发键后，左键按下点即轮盘锚点，拖过阈值开轮盘，松开左键执行
+      if (!pingArmed) return;
+      if (event.button === 2) { if (pingWheel() || pingPending) { event.preventDefault(); event.stopPropagation(); pingCancel(); } return; }
+      if (event.button !== 0) return;
+      event.preventDefault(); event.stopPropagation();
+      pingPending = { x: event.clientX, y: event.clientY };
+      return;
+    }
     if (!pingWheel()) return;
     event.preventDefault(); event.stopPropagation();
     if (event.button === 2) { pingCancel(); return; } // 右键取消
     if (event.button !== 0) return;
     firePingFromClick(event.clientX, event.clientY); // 点击槽位执行，点中心=关闭
+  };
+  const pingPointerMove = (event: PointerEvent) => {
+    if (!pingLol() || !pingArmed || !pingPending) return;
+    const wheel = pingWheel();
+    if (wheel) {
+      const next = pingPickSlice(event.clientX - wheel.x, event.clientY - wheel.y);
+      if (next !== pingSlot()) { setPingSlot(next); if (next >= 0) playPingSound('tick'); } // 切片切换轻响
+      return;
+    }
+    if (Math.hypot(event.clientX - pingPending.x, event.clientY - pingPending.y) > PING_DRAG_THRESHOLD) openPingWheel(pingPending);
+  };
+  const pingPointerUp = (event: PointerEvent) => {
+    if (!pingLol() || !pingArmed || event.button !== 0 || !pingPending) return;
+    event.preventDefault(); event.stopPropagation();
+    const press = pingPending;
+    const wheel = pingWheel();
+    pingPending = null;
+    setPingWheel(null);
+    const slotIndex = wheel ? pingPickSlice(event.clientX - wheel.x, event.clientY - wheel.y) : 0;
+    setPingSlot(-1);
+    firePingAt(press.x, press.y, slotIndex); // 未拖动就松开 = 快速 ping 北槽
   };
   const focusReference = (event: Event) => {
     const reference = (event as CustomEvent<Reference>).detail;
@@ -887,6 +939,8 @@ export default function SpaceCanvas(props: Props) {
   document.addEventListener('keydown', recordKey, true);
   document.addEventListener('keyup', releaseKey, true);
   document.addEventListener('pointerdown', pingPointerDown, true);
+  document.addEventListener('pointermove', pingPointerMove, true);
+  document.addEventListener('pointerup', pingPointerUp, true);
   document.addEventListener('focusin', snapFocus); document.addEventListener('visibilitychange', snapVisibility);
   onCleanup(() => {
     disposed = true;
@@ -905,6 +959,9 @@ export default function SpaceCanvas(props: Props) {
     document.removeEventListener('keydown', recordKey, true);
     document.removeEventListener('keyup', releaseKey, true);
     document.removeEventListener('pointerdown', pingPointerDown, true);
+    document.removeEventListener('pointermove', pingPointerMove, true);
+    document.removeEventListener('pointerup', pingPointerUp, true);
+    if (pingMarkerTimer !== undefined) clearTimeout(pingMarkerTimer);
   });
   createEffect(() => {
     const background = props.scene.background, id = props.scene.id;
@@ -1075,8 +1132,8 @@ export default function SpaceCanvas(props: Props) {
     <Show when={selectionPreview()}>{box => <div class="capture-selection" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />}</Show>
     <For each={queuedSelectionPreviews()}>{pending => { const box = createMemo(() => display(pending.region)); return <div class="capture-selection" data-pending-selection="queued" aria-hidden="true" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />; }}</For>
     <Show when={pingWheel()}>{wheel => (
-      <svg class="ping-wheel" width={PING_WHEEL_SIZE} height={PING_WHEEL_SIZE} viewBox={`0 0 ${PING_WHEEL_SIZE} ${PING_WHEEL_SIZE}`} role="menu" aria-label={t('ping 轮盘')} style={{ left: `${wheel().x - PING_WHEEL_SIZE / 2}px`, top: `${wheel().y - PING_WHEEL_SIZE / 2}px` }}>
-        <g transform={`translate(${PING_WHEEL_SIZE / 2} ${PING_WHEEL_SIZE / 2})`}>
+      <svg class="ping-wheel" width={pingWheelSize()} height={pingWheelSize()} viewBox={`0 0 ${pingWheelSize()} ${pingWheelSize()}`} role="menu" aria-label={t('ping 轮盘')} style={{ left: `${wheel().x - pingWheelSize() / 2}px`, top: `${wheel().y - pingWheelSize() / 2}px` }}>
+        <Show when={pingLol()} fallback={<g transform={`translate(${pingWheelSize() / 2} ${pingWheelSize() / 2})`}>
           <For each={pingSlots()}>{slot => (
             <path class="ping-wedge" classList={{ hot: pingSlot() === slot.index }} d={pingSector(PING_WHEEL_INNER, PING_WHEEL_OUTER, -112.5 + slot.index * 45, -67.5 + slot.index * 45)} />
           )}</For>
@@ -1088,8 +1145,53 @@ export default function SpaceCanvas(props: Props) {
           <Show when={pingSlots()[pingSlot()]} keyed>{slot => { const [lx, ly] = pingPolar(PING_WHEEL_LABEL_R, -90 + slot.index * 45); return (
             <text class="ping-slice-title" x={lx} y={ly}>{slot.title}</text>
           ); }}</Show>
-        </g>
+        </g>}>
+          <defs>
+            <radialGradient id="pw-ext" cx="0" cy="0" r={PING_WHEEL_EXT} gradientUnits="userSpaceOnUse">
+              <stop offset={PING_WHEEL_OUTER / PING_WHEEL_EXT} stop-color="#5c6066" stop-opacity="0.55" /><stop offset="1" stop-color="#5c6066" stop-opacity="0" />
+            </radialGradient>
+            <radialGradient id="pw-ring" cx="0" cy="0" r={PING_WHEEL_OUTER} gradientUnits="userSpaceOnUse">
+              <stop offset={PING_WHEEL_INNER / PING_WHEEL_OUTER} stop-color="#2a2d31" /><stop offset="1" stop-color="#4a4e54" />
+            </radialGradient>
+            <radialGradient id="pw-hot" cx="0" cy="0" r={PING_WHEEL_EXT} gradientUnits="userSpaceOnUse">
+              <stop offset={PING_WHEEL_INNER / PING_WHEEL_EXT} stop-color="#8a8f96" /><stop offset={PING_WHEEL_OUTER / PING_WHEEL_EXT} stop-color="#9aa0a8" /><stop offset="1" stop-color="#9aa0a8" stop-opacity="0" />
+            </radialGradient>
+            <radialGradient id="pw-core" cx="0" cy="-10" r={PING_WHEEL_INNER} gradientUnits="userSpaceOnUse">
+              <stop offset="0" stop-color="#2c5d60" /><stop offset="1" stop-color="#11292c" />
+            </radialGradient>
+          </defs>
+          <g transform={`translate(${pingWheelSize() / 2} ${pingWheelSize() / 2})`}>
+            <For each={pingSlots()}>{slot => slot.index % 2 === 0 ? (
+              <path d={pingSector(PING_WHEEL_OUTER, PING_WHEEL_EXT, -112.5 + slot.index * 45, -67.5 + slot.index * 45)} fill="url(#pw-ext)" />
+            ) : null}</For>
+            <circle r={(PING_WHEEL_INNER + PING_WHEEL_OUTER) / 2} fill="none" stroke="url(#pw-ring)" stroke-width={PING_WHEEL_OUTER - PING_WHEEL_INNER} opacity="0.92" />
+            <For each={pingSlots()}>{slot => (<>
+              <path class="ping-lol-wedge" classList={{ hot: pingSlot() === slot.index }} fill="url(#pw-hot)" d={pingSector(PING_WHEEL_INNER, slot.index % 2 === 0 ? PING_WHEEL_EXT : PING_WHEEL_OUTER, -112.5 + slot.index * 45, -67.5 + slot.index * 45)} />
+              {(() => { const reach = slot.index % 2 === 0 ? PING_WHEEL_EXT : PING_WHEEL_OUTER; const [x0, y0] = pingPolar(PING_WHEEL_INNER, -112.5 + slot.index * 45), [x1, y1] = pingPolar(reach, -112.5 + slot.index * 45); return <line x1={x0} y1={y0} x2={x1} y2={y1} stroke="#a08a5c" stroke-opacity="0.45" stroke-width="1.2" />; })()}
+            </>)}</For>
+            <For each={pingSlots()}>{slot => { const [ix, iy] = pingPolar(PING_WHEEL_ICON_R, -90 + slot.index * 45); const icon = slot.icon ?? PING_WHEEL_ICONS[slot.action]; return icon
+              ? <image class="ping-lol-icon" classList={{ hot: pingSlot() === slot.index }} href={icon} x={ix - PING_WHEEL_ICON_SIZE / 2} y={iy - PING_WHEEL_ICON_SIZE / 2} width={PING_WHEEL_ICON_SIZE} height={PING_WHEEL_ICON_SIZE} />
+              : <text class="ping-wedge-icon" classList={{ hot: pingSlot() === slot.index }} x={ix} y={iy + 9}>{slot.label}</text>; }}</For>
+            <circle r={PING_WHEEL_INNER + 4} fill="none" stroke="#1a1a1a" stroke-width="6" opacity="0.6" />
+            <circle r={PING_WHEEL_INNER} fill="url(#pw-core)" stroke="#c8aa6e" stroke-width="3" />
+            <circle r={PING_WHEEL_INNER - 7} fill="none" stroke="#8a7448" stroke-width="1" opacity="0.6" />
+            <Show when={PING_HUB_ICON} keyed>{url => <image href={url} x={-20} y={-58} width={40} height={40} />}</Show>
+            <text x="0" y="6" text-anchor="middle" class="ping-lol-center">PING</text>
+            <text x="6" y="50" text-anchor="middle" class="ping-lol-back">BACK</text>
+            <Show when={pingSlots()[pingSlot()]} keyed>{slot => (
+              <text class="ping-slice-title" x="0" y={PING_WHEEL_EXT + 26}>{slot.title}</text>
+            )}</Show>
+          </g>
+        </Show>
       </svg>
+    )}</Show>
+    <Show when={pingMarker()} keyed>{m => (
+      <div class="ping-fx" style={`left:${m.x}px; top:${m.y}px; --c:${m.color}; --size:110px; --dur:3.2s;`} aria-hidden="true">
+        <div class="pf-ground" /><div class="pf-ring" /><div class="pf-ring pf-r2" /><div class="pf-ring pf-r3" />
+        <div class="pf-art">
+          <Show when={m.icon} keyed fallback={<span class="pf-emoji">{m.label}</span>}>{url => <img src={url} alt="" />}</Show>
+        </div>
+      </div>
     )}</Show>
     {/* Native region observation temporarily hides this window and causes blur; keep the invocation owner mounted. */}
     <Show when={(toolbarVisible() || extensionInteracting()) && !drawingSession() && !imageDrawing() && !activity() && !forceNew() && activeRegion()}>{region => <div ref={bindToolbar} class="capture-toolbar" role="toolbar" aria-label={t("截图工具")} style={{ left: `${toolbarBox().x}px`, top: `${toolbarBox().y}px` }} onPointerDown={event => { event.stopPropagation(); if (window.getSelection()?.anchorNode?.parentElement?.closest('.ocr-text-layer')) event.preventDefault(); }} onPointerEnter={clearHideTimer}>

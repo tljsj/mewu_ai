@@ -61,3 +61,22 @@
 .ping-slot-label{width:5.5em;margin-left:6px}
 .ping-wedge-image{filter:drop-shadow(0 0 4px rgba(0,0,0,.5));transition:transform .07s ease;transform-box:fill-box;transform-origin:center}
 .ping-wedge-image.hot{transform:scale(1.15)}
+.ping-lol-wedge{fill-opacity:0;transition:fill-opacity .08s ease}
+.ping-lol-wedge.hot{fill-opacity:.55}
+.ping-lol-icon{filter:grayscale(.85) brightness(.9);transition:filter .1s ease,transform .1s ease;transform-box:fill-box;transform-origin:center}
+.ping-lol-icon.hot{filter:none;transform:scale(1.18)}
+.ping-lol-center{font:600 15px "Segoe UI",sans-serif;letter-spacing:1px;fill:#1fa9e0}
+.ping-lol-back{font:600 9px "Segoe UI",sans-serif;fill:#6c7a7c;letter-spacing:.5px}
+.ping-fx{position:fixed;z-index:59;width:0;height:0;pointer-events:none;--size:110px;--dur:3.2s}
+.pf-ground{position:absolute;left:calc(var(--size)*-0.42);top:calc(var(--size)*0.2);width:calc(var(--size)*0.84);height:calc(var(--size)*0.24);border-radius:50%;background:radial-gradient(closest-side,var(--c),transparent);opacity:0;animation:pf-ground var(--dur) ease-out forwards}
+.pf-ring{position:absolute;left:calc(var(--size)*-0.545);top:calc(var(--size)*-0.545);width:calc(var(--size)*1.09);height:calc(var(--size)*1.09);box-sizing:border-box;border-radius:50%;border:3px solid var(--c);box-shadow:0 0 18px var(--c),inset 0 0 12px var(--c);opacity:0;animation:pf-ring .65s ease-out forwards}
+.pf-ring.pf-r2{animation-delay:.22s}
+.pf-ring.pf-r3{animation-delay:1.4s}
+.pf-art{position:absolute;left:calc(var(--size)*-0.5);top:calc(var(--size)*-0.73);width:var(--size);height:var(--size);animation:pf-life var(--dur) linear forwards}
+.pf-art img{position:absolute;inset:0;width:100%;height:100%;filter:drop-shadow(0 0 10px var(--c));animation:pf-pop .28s cubic-bezier(.2,1.6,.4,1) both,pf-bob 1.6s ease-in-out .3s infinite}
+.pf-emoji{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font:700 64px "Segoe UI Emoji","Segoe UI",sans-serif;color:var(--c);text-shadow:0 0 12px var(--c);animation:pf-pop .28s cubic-bezier(.2,1.6,.4,1) both,pf-bob 1.6s ease-in-out .3s infinite}
+@keyframes pf-ring{0%{transform:scale(.25);opacity:.95}100%{transform:scale(1.35);opacity:0}}
+@keyframes pf-ground{0%{opacity:0}10%{opacity:.75}85%{opacity:.55}100%{opacity:0}}
+@keyframes pf-life{0%,85%{opacity:1}100%{opacity:0}}
+@keyframes pf-pop{0%{transform:scale(.4);opacity:0}60%{transform:scale(1.15);opacity:1}100%{transform:scale(1)}}
+@keyframes pf-bob{0%,100%{translate:0 0}50%{translate:0 -5px}}
