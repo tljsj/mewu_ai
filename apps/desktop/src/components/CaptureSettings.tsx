@@ -19,23 +19,43 @@ import { getPlugins, subscribePlugins } from '../plugin-bridge';
 import type { PluginRecord } from '../plugin-contracts';
 
 const PING_WHEEL_DIRECTIONS = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'] as const;
-const formatPingTrigger = (value: PingWheelTriggerPref) => [value.ctrl && 'Ctrl', value.shift && 'Shift', value.alt && 'Alt', value.code.replace(/^Key|^Digit/, '')].filter(Boolean).join(' + ');
+const formatPingTrigger = (value: PingWheelTriggerPref) => [value.ctrl && 'Ctrl', value.shift && 'Shift', value.alt && 'Alt', value.code.replace(/^Key|^Digit/, '').replace('Control', 'Ctrl')].filter(Boolean).join(' + ');
 function PingTriggerField(props: { value: PingWheelTriggerPref; onChange: (value: PingWheelTriggerPref) => void }) {
   const [recording, setRecording] = createSignal(false);
+  const [notice, setNotice] = createSignal('');
+  let heldModifier = '';
   const captureKey = (event: KeyboardEvent) => {
     event.preventDefault(); event.stopPropagation();
-    if (event.key === 'Escape') { stop(); return; }
-    if (event.repeat || event.isComposing || event.metaKey || !/^[a-z0-9]$/i.test(event.key)) return;
-    stop();
-    props.onChange({ code: /^[0-9]$/.test(event.key) ? `Digit${event.key}` : `Key${event.key.toUpperCase()}`, ctrl: event.ctrlKey, shift: event.shiftKey, alt: event.altKey });
+    if (event.key === 'Escape') { heldModifier = ''; stop(); return; }
+    if (event.repeat || event.isComposing || event.metaKey) return;
+    if (/^[a-z0-9]$/i.test(event.key)) {
+      if (!event.ctrlKey && !event.shiftKey && !event.altKey) { setNotice('裸字母/数字会打进输入框，请加修饰键或用 Alt'); return; } // 限制：不允许与打字冲突的键
+      heldModifier = '';
+      stop();
+      props.onChange({ code: /^[0-9]$/.test(event.key) ? `Digit${event.key}` : `Key${event.key.toUpperCase()}`, ctrl: event.ctrlKey, shift: event.shiftKey, alt: event.altKey });
+    } else if (event.key === 'Alt' || event.key === 'Control' || event.key === 'Shift') {
+      heldModifier = event.key; // 可能是在组组合键：等字母；直接松开则记为裸修饰键
+    }
   };
-  const stop = () => { window.removeEventListener('keydown', captureKey, true); setRecording(false); };
+  const captureKeyUp = (event: KeyboardEvent) => {
+    if (!heldModifier || event.key !== heldModifier) return;
+    event.preventDefault(); event.stopPropagation();
+    const code = heldModifier;
+    heldModifier = '';
+    stop();
+    props.onChange({ code, ctrl: false, shift: false, alt: false });
+  };
+  const stop = () => { window.removeEventListener('keydown', captureKey, true); window.removeEventListener('keyup', captureKeyUp, true); setRecording(false); };
   onCleanup(stop);
-  return <button class="secondary-button" classList={{ 'ping-trigger-recording': recording() }} onClick={() => {
-    if (recording()) { stop(); return; }
-    setRecording(true);
-    window.addEventListener('keydown', captureKey, true);
-  }}>{recording() ? t('按下新按键（Esc 取消）') : formatPingTrigger(props.value)}</button>;
+  return <span class="ping-trigger-field">
+    <button class="secondary-button" classList={{ 'ping-trigger-recording': recording() }} onClick={() => {
+      if (recording()) { heldModifier = ''; setNotice(''); stop(); return; }
+      setNotice(''); setRecording(true);
+      window.addEventListener('keydown', captureKey, true);
+      window.addEventListener('keyup', captureKeyUp, true);
+    }}>{recording() ? t('单独按 Alt/Ctrl/Shift 松开即设为该键；或修饰键+字母') : formatPingTrigger(props.value)}</button>
+    <Show when={notice()}><span class="settings-error" role="alert">{notice()}</span></Show>
+  </span>;
 }
 
 export default function CaptureSettings(props: { active: boolean; preferences: Preferences; onPreferences: (value: Preferences) => void; platform?: SettingsInfo['platform']; api?: SettingsClient }) {
