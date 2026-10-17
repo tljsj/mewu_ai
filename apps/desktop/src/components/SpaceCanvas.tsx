@@ -43,6 +43,7 @@ import { type TranslationLanguage, type TranslationPending, type TranslationRequ
 import { OcrRequestGate, type OcrRequest } from '../ocr-request';
 import { sameOcrTarget } from '../ocr-selection';
 import { finishCapture } from '../capture-completion';
+import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelSlotPref, type PingWheelTriggerPref } from '../interface-preferences';
 import { regionImageProjection } from '../region-image';
 import { getWindowSnapMap } from '../window-snap-bridge';
 import { DrawingInputPhase, drawingDiagnosticsEnabled, recordDrawingInput } from '../drawing-diagnostics';
@@ -108,6 +109,8 @@ interface Props {
   onClearTranslationNotice?: () => void;
   busy: boolean;
   maskOpacity: number;
+  pingWheelTrigger?: PingWheelTriggerPref;
+  pingWheelSlots?: readonly PingWheelSlotPref[];
 }
 interface Box { x: number; y: number; width: number; height: number }
 interface PendingSelection { sceneId: string; backgroundId: string; region: Region; version: number; automatic?: SnapNode; complete: boolean; acknowledged?: boolean; presented?: boolean }
@@ -118,7 +121,7 @@ const EDGES: Handle[] = ['n', 'w', 'e', 's'];
 const TOOLBAR_WIDTH = 405, TOOLBAR_HEIGHT = 60, EDGE = 6, GAP = 8, TOLERANCE = 24;
 // ping 轮盘：按住触发键（默认 G）在鼠标处唤出，移动高亮槽位，点击执行；松开触发键/Esc/右键取消。
 // 槽位只做既有动作的分发，轮盘本体不含任何图片或音频素材。
-const PING_WHEEL_BUILTIN_ACTIONS: ReadonlyArray<{ action: string; title: string; label: string }> = [
+export const PING_WHEEL_BUILTIN_ACTIONS: ReadonlyArray<{ action: string; title: string; label: string }> = [
   { action: 'explain', title: '解释', label: '?' },
   { action: 'pin', title: '贴图', label: '📌' },
   { action: 'copy', title: '复制', label: '📋' },
@@ -128,8 +131,7 @@ const PING_WHEEL_BUILTIN_ACTIONS: ReadonlyArray<{ action: string; title: string;
   { action: 'translate', title: '翻译', label: '🌐' },
   { action: 'table', title: '表格', label: '▦' },
 ];
-const DEFAULT_PING_WHEEL_SLOTS: readonly { action: string }[] = PING_WHEEL_BUILTIN_ACTIONS.map(({ action }) => ({ action }));
-const PING_WHEEL_TRIGGER = { code: 'KeyG', ctrl: false, shift: false, alt: false };
+const DEFAULT_PING_WHEEL_SLOTS_FALLBACK = DEFAULT_PING_WHEEL_SLOTS;
 const PING_WHEEL_SIZE = 440, PING_WHEEL_INNER = 62, PING_WHEEL_OUTER = 152, PING_WHEEL_ICON_R = 107, PING_WHEEL_LABEL_R = 196;
 const pingPolar = (r: number, deg: number): [number, number] => [r * Math.cos((deg * Math.PI) / 180), r * Math.sin((deg * Math.PI) / 180)];
 function pingSector(r0: number, r1: number, a0: number, a1: number): string {
@@ -141,7 +143,6 @@ const pingPickSlice = (dx: number, dy: number): number => {
   const deg = ((Math.atan2(dy, dx) * 180) / Math.PI + 90 + 22.5 + 360) % 360;
   return Math.floor(deg / 45) % 8; // 0=北，顺时针，扇区以罗盘方向为中心
 };
-const pingTriggerMatches = (event: KeyboardEvent) => event.code === PING_WHEEL_TRIGGER.code && event.ctrlKey === PING_WHEEL_TRIGGER.ctrl && event.shiftKey === PING_WHEEL_TRIGGER.shift && event.altKey === PING_WHEEL_TRIGGER.alt && !event.metaKey;
 const contains = (box: Box, x: number, y: number, padding = 0) => x >= box.x - padding && x <= box.x + box.width + padding && y >= box.y - padding && y <= box.y + box.height + padding;
 const overlaps = (a: Box, b: Box) => a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(Math.max(low, high), value));
@@ -524,9 +525,14 @@ export default function SpaceCanvas(props: Props) {
     if (translationEntries().length === 1) runTranslation(translationEntries()[0], region);
     else if (translationEntries().length) { setPluginMenu('translation'); }
   }
-  const pingSlots = () => DEFAULT_PING_WHEEL_SLOTS.map((slot, index) => {
+  const pingTrigger = () => props.pingWheelTrigger ?? DEFAULT_PING_WHEEL_TRIGGER;
+  const pingTriggerMatchesEvent = (event: KeyboardEvent) => {
+    const trigger = pingTrigger();
+    return event.code === trigger.code && event.ctrlKey === trigger.ctrl && event.shiftKey === trigger.shift && event.altKey === trigger.alt && !event.metaKey;
+  };
+  const pingSlots = () => (props.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS_FALLBACK).map((slot, index) => {
     const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
-    return { label: slot.action === 'none' ? '' : builtin?.label ?? '▪', title: builtin?.title ?? slot.action, action: slot.action, index };
+    return { label: slot.label?.trim() || (builtin?.label ?? '▪'), title: builtin?.title ?? slot.action, action: slot.action, index };
   });
   function pingCancel() {
     setPingWheel(null);
@@ -769,14 +775,14 @@ export default function SpaceCanvas(props: Props) {
       event.preventDefault(); event.stopImmediatePropagation();
       return;
     }
-    if (pingTriggerMatches(event) && !event.defaultPrevented && !event.isComposing && !event.repeat) {
+    if (pingTriggerMatchesEvent(event) && !event.defaultPrevented && !event.isComposing && !event.repeat) {
       const target = event.target instanceof Element ? event.target : document.activeElement;
       if (!target?.closest('input,textarea,select,.artifact-card,.ocr-text-layer,.drawing-editor,[contenteditable]:not([contenteditable="false"])') && !document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]') && props.scene.background && !backgroundError() && !drawingSession()) {
         pingArmed = true;
         event.preventDefault(); event.stopImmediatePropagation();
         openPingWheel();
       }
-    } else if (pingArmed && event.code === PING_WHEEL_TRIGGER.code) { // 扣住：按住期间的重复按键不得输入
+    } else if (pingArmed && event.code === pingTrigger().code) { // 扣住：按住期间的重复按键不得输入
       event.preventDefault(); event.stopImmediatePropagation();
     }
     const videoItem = props.scene.items.find(item => item.id === activeItemId() && item.asset.kind === 'video');
@@ -830,7 +836,7 @@ export default function SpaceCanvas(props: Props) {
   const releaseKey = (event: KeyboardEvent) => {
     if (event.key === 'Shift' && snapPointer) updateSnapPreview({ ...snapPointer, shiftKey: false });
     if (heldArrows.delete(event.key) && !heldArrows.size) props.geometryController.endKeys();
-    if (event.code === PING_WHEEL_TRIGGER.code && pingArmed) { pingArmed = false; pingCancel(); } // 松开触发键 = 关闭轮盘
+    if (event.code === pingTrigger().code && pingArmed) { pingArmed = false; pingCancel(); } // 松开触发键 = 关闭轮盘
   };
   const pingPointerDown = (event: PointerEvent) => {
     if (!pingWheel()) return;
@@ -1063,7 +1069,6 @@ export default function SpaceCanvas(props: Props) {
         </g>
       </svg>
     )}</Show>
->>>>>>> bf8ee74 (截图画布 ping 轮盘：按住 G 唤出，移动高亮，点击槽位执行既有动作)
     {/* Native region observation temporarily hides this window and causes blur; keep the invocation owner mounted. */}
     <Show when={(toolbarVisible() || extensionInteracting()) && !drawingSession() && !imageDrawing() && !activity() && !forceNew() && activeRegion()}>{region => <div ref={bindToolbar} class="capture-toolbar" role="toolbar" aria-label={t("截图工具")} style={{ left: `${toolbarBox().x}px`, top: `${toolbarBox().y}px` }} onPointerDown={event => { event.stopPropagation(); if (window.getSelection()?.anchorNode?.parentElement?.closest('.ocr-text-layer')) event.preventDefault(); }} onPointerEnter={clearHideTimer}>
       <Show when={props.aiAvailable !== false}><button data-caption={t("引用")} class="capture-reference" classList={{ 'capture-referenced': referenced(region().id) }} title={referenced(region().id) ? t("已引用") : t("引用当前区域")} aria-label={t("引用当前区域")} disabled={blocked()} onClick={() => { if (!referenced(region().id)) props.onReference({ kind: 'region', id: region().id }); props.onFocusComposer?.(); }}>@</button></Show>
