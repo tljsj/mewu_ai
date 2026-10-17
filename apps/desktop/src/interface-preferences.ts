@@ -2,18 +2,20 @@
 import type { UiLanguage } from './i18n';
 import { translationLanguages, type TranslationLanguage } from './translation-request';
 import type { PreviewResolution } from './video-preview';
-/** ping 轮盘触发键：物理键 code（KeyA-Z / Digit0-9）+ 三个修饰键开关；裸键合法。 */
+/** ping 轮盘触发键：裸修饰键（'Alt'|'Control'|'Shift'，推荐，不与打字冲突），或带至少一个修饰键的字母/数字组合；裸字母/数字会打进输入框，不允许。 */
 export interface PingWheelTriggerPref { code: string; ctrl: boolean; shift: boolean; alt: boolean }
 /** ping 轮盘槽位：方位由数组下标决定（0=北，顺时针），action 见 SpaceCanvas 的动作池，label 为槽位图标文字（可空用默认），icon 为用户自带的图片 data URL（可空，仅存本地偏好，不随源码分发）。 */
 export interface PingWheelSlotPref { action: string; label?: string; icon?: string }
-export const DEFAULT_PING_WHEEL_TRIGGER: PingWheelTriggerPref = { code: 'KeyG', ctrl: false, shift: false, alt: false };
+export const DEFAULT_PING_WHEEL_TRIGGER: PingWheelTriggerPref = { code: 'Alt', ctrl: false, shift: false, alt: false };
 export const DEFAULT_PING_WHEEL_SLOTS: readonly PingWheelSlotPref[] = [
   { action: 'explain' }, { action: 'pin' }, { action: 'copy' }, { action: 'save' },
   { action: 'cancel' }, { action: 'ocr' }, { action: 'translate' }, { action: 'table' },
 ];
 const validTrigger = (value: unknown): value is PingWheelTriggerPref =>
-  Boolean(value) && typeof value === 'object' && /^(Key[A-Z]|Digit[0-9])$/.test((value as PingWheelTriggerPref).code)
-  && [(value as PingWheelTriggerPref).ctrl, (value as PingWheelTriggerPref).shift, (value as PingWheelTriggerPref).alt].every(flag => typeof flag === 'boolean');
+  Boolean(value) && typeof value === 'object' && /^(Key[A-Z]|Digit[0-9]|Alt|Control|Shift)$/.test((value as PingWheelTriggerPref).code)
+  && [(value as PingWheelTriggerPref).ctrl, (value as PingWheelTriggerPref).shift, (value as PingWheelTriggerPref).alt].every(flag => typeof flag === 'boolean')
+  && (/^(Alt|Control|Shift)$/.test((value as PingWheelTriggerPref).code)
+    || (value as PingWheelTriggerPref).ctrl || (value as PingWheelTriggerPref).shift || (value as PingWheelTriggerPref).alt); // 字母/数字必须带修饰键
 const validSlots = (value: unknown): PingWheelSlotPref[] => {
   if (!Array.isArray(value)) return [...DEFAULT_PING_WHEEL_SLOTS];
   const cleaned = value.filter((slot): slot is PingWheelSlotPref =>
