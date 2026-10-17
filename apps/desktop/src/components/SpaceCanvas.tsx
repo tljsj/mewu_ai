@@ -43,7 +43,7 @@ import { sameOcrTarget } from '../ocr-selection';
 import { finishCapture } from '../capture-completion';
 import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelSlotPref, type PingWheelTriggerPref } from '../interface-preferences';
 import { playPingAudio, playPingSound } from '../ping-sound';
-import { PING_HUB_ICON, PING_MARKER_ART, PING_VOICES, PING_WHEEL_ICONS } from '../ping-assets';
+import { PING_HUB_ICON, PING_MARKER_ART, PING_SKINS, PING_VOICES, PING_WHEEL_ICONS } from '../ping-assets';
 import { regionImageProjection } from '../region-image';
 import { getWindowSnapMap } from '../window-snap-bridge';
 import { SnapMapLoader, SnapSelectionGesture, SnapshotSelections, snapImagePoint, snapResize, snapTarget, type FrameSnapMap } from '../window-snap';
@@ -496,7 +496,8 @@ export default function SpaceCanvas(props: Props) {
     if (slot.action === 'none') return { label: '', title: '', action: slot.action, icon: undefined as string | undefined, index };
     const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
     const workflow = workflowEntryFor(slot.action);
-    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon, index };
+    const skinEntry = slot.skin ? PING_SKINS[slot.skin] : undefined;
+    return { label: slot.label?.trim() || (builtin?.label ?? (workflow ? '◈' : '▪')), title: workflow?.contribution.title ?? builtin?.title ?? slot.action, action: slot.action, icon: slot.icon ?? (skinEntry?.icon || undefined), art: skinEntry?.art || undefined, voice: skinEntry?.voice || undefined, color: skinEntry?.color, index };
   });
   function pingCancel() {
     pingPending = null;
@@ -552,9 +553,9 @@ export default function SpaceCanvas(props: Props) {
     firePingAt(wheel.x, wheel.y, slotIndex);
   }
   // LOL 模式的 ping 标记：三层扩散环 + 弹跳图标 + 地面光晕（颜色按方位），约 3.2s 后消失
-  function spawnPingMarker(x: number, y: number, slot: { action: string; icon?: string; label: string }, slotIndex: number) {
-    playPingAudio(PING_VOICES[slot.action], 0.5); // 第二层：标记生成时的语音音效
-    setPingMarker({ x, y, icon: slot.icon ?? PING_MARKER_ART[slot.action] ?? PING_WHEEL_ICONS[slot.action], label: slot.label, color: PING_WHEEL_SLOT_COLORS[slotIndex] ?? '#f2c518', id: Date.now() });
+  function spawnPingMarker(x: number, y: number, slot: { action: string; icon?: string; art?: string; voice?: string; label: string; color?: string }, slotIndex: number) {
+    playPingAudio(slot.voice || PING_VOICES[slot.action], 0.5); // 第二层：标记生成时的语音音效（皮肤优先）
+    setPingMarker({ x, y, icon: slot.icon ?? slot.art ?? PING_MARKER_ART[slot.action] ?? PING_WHEEL_ICONS[slot.action], label: slot.label, color: slot.color ?? PING_WHEEL_SLOT_COLORS[slotIndex] ?? '#f2c518', id: Date.now() });
     if (pingMarkerTimer !== undefined) clearTimeout(pingMarkerTimer);
     pingMarkerTimer = window.setTimeout(() => { pingMarkerTimer = undefined; setPingMarker(null); }, 3300);
   }
