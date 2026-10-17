@@ -472,8 +472,9 @@ export default function SpaceCanvas(props: Props) {
     else if (translationEntries().length) { setPluginMenu('translation'); }
   }
   const pingTrigger = () => props.pingWheelTrigger ?? DEFAULT_PING_WHEEL_TRIGGER;
-  const pingTriggerMatchesEvent = (event: KeyboardEvent) => {
+  const pingTriggerMatchesEvent = (event: Pick<KeyboardEvent, 'code' | 'key' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'metaKey'>) => {
     const trigger = pingTrigger();
+    if (trigger.code === 'Alt' || trigger.code === 'Control' || trigger.code === 'Shift') return event.key === trigger.code && !event.metaKey; // 裸修饰键触发（任意物理侧）
     return event.code === trigger.code && event.ctrlKey === trigger.ctrl && event.shiftKey === trigger.shift && event.altKey === trigger.alt && !event.metaKey;
   };
   const workflowEntryFor = (action: string) => {
@@ -654,7 +655,7 @@ export default function SpaceCanvas(props: Props) {
         event.preventDefault(); event.stopImmediatePropagation();
         openPingWheel();
       }
-    } else if (pingArmed && event.code === pingTrigger().code) { // 扣住：按住期间的重复按键不得输入
+    } else if (pingArmed && (event.code === pingTrigger().code || event.key === pingTrigger().code)) { // 扣住：按住期间的重复按键不得输入
       event.preventDefault(); event.stopImmediatePropagation();
     }
     const videoItem = props.scene.items.find(item => item.id === activeItemId() && item.asset.kind === 'video');
@@ -708,7 +709,7 @@ export default function SpaceCanvas(props: Props) {
   const releaseKey = (event: KeyboardEvent) => {
     if (event.key === 'Shift' && snapPointer) updateSnapPreview({ ...snapPointer, shiftKey: false });
     if (heldArrows.delete(event.key) && !heldArrows.size) props.geometryController.endKeys();
-    if (event.code === pingTrigger().code && pingArmed) { pingArmed = false; pingCancel(); } // 松开触发键 = 关闭轮盘
+    if (pingArmed && pingTriggerMatchesEvent(event)) { pingArmed = false; pingCancel(); } // 松开触发键 = 关闭轮盘
   };
   const pingPointerDown = (event: PointerEvent) => {
     if (!pingWheel()) return;
