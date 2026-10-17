@@ -12,12 +12,23 @@ function ensureContext(): AudioContext {
   return audioContext;
 }
 
+function dataUrlToArrayBuffer(url: string): ArrayBuffer | undefined {
+  const marker = ';base64,';
+  const index = url.indexOf(marker);
+  if (index < 0) return undefined;
+  const binary = atob(url.slice(index + marker.length));
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
 async function decode(url: string): Promise<void> {
   if (buffers.has(url) || decoding.has(url)) return;
   decoding.add(url);
   try {
-    const response = await fetch(url);
-    buffers.set(url, await ensureContext().decodeAudioData(await response.arrayBuffer()));
+    // data URL 直接本地解码，不经 fetch——fetch(data:) 受 connect-src 管制会被 CSP 拦截
+    const arrayBuffer = dataUrlToArrayBuffer(url) ?? (await (await fetch(url)).arrayBuffer());
+    buffers.set(url, await ensureContext().decodeAudioData(arrayBuffer));
   } catch { /* 解码失败：播放时走 HTMLAudio 退化 */ }
   finally { decoding.delete(url); }
 }
