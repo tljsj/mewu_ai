@@ -117,6 +117,32 @@ type Handle = 'nw' | 'n' | 'ne' | 'w' | 'e' | 'sw' | 's' | 'se';
 const CORNERS: Handle[] = ['nw', 'ne', 'sw', 'se'];
 const EDGES: Handle[] = ['n', 'w', 'e', 's'];
 const TOOLBAR_WIDTH = 405, TOOLBAR_HEIGHT = 60, EDGE = 6, GAP = 8, TOLERANCE = 24;
+// ping 轮盘：按住触发键（默认 G）在鼠标处唤出，移动高亮槽位，点击执行；松开触发键/Esc/右键取消。
+// 槽位只做既有动作的分发，轮盘本体不含任何图片或音频素材。
+const PING_WHEEL_BUILTIN_ACTIONS: ReadonlyArray<{ action: string; title: string; label: string }> = [
+  { action: 'explain', title: '解释', label: '?' },
+  { action: 'pin', title: '贴图', label: '📌' },
+  { action: 'copy', title: '复制', label: '📋' },
+  { action: 'save', title: '保存', label: '💾' },
+  { action: 'cancel', title: '取消', label: '✕' },
+  { action: 'ocr', title: '识别', label: 'T' },
+  { action: 'translate', title: '翻译', label: '🌐' },
+  { action: 'table', title: '表格', label: '▦' },
+];
+const DEFAULT_PING_WHEEL_SLOTS: readonly { action: string }[] = PING_WHEEL_BUILTIN_ACTIONS.map(({ action }) => ({ action }));
+const PING_WHEEL_TRIGGER = { code: 'KeyG', ctrl: false, shift: false, alt: false };
+const PING_WHEEL_SIZE = 440, PING_WHEEL_INNER = 62, PING_WHEEL_OUTER = 152, PING_WHEEL_ICON_R = 107, PING_WHEEL_LABEL_R = 196;
+const pingPolar = (r: number, deg: number): [number, number] => [r * Math.cos((deg * Math.PI) / 180), r * Math.sin((deg * Math.PI) / 180)];
+function pingSector(r0: number, r1: number, a0: number, a1: number): string {
+  const [x0, y0] = pingPolar(r0, a0), [x1, y1] = pingPolar(r1, a0), [x2, y2] = pingPolar(r1, a1), [x3, y3] = pingPolar(r0, a1);
+  return `M${x0},${y0} L${x1},${y1} A${r1},${r1} 0 0 1 ${x2},${y2} L${x3},${y3} A${r0},${r0} 0 0 0 ${x0},${y0}Z`;
+}
+const pingPickSlice = (dx: number, dy: number): number => {
+  if (Math.hypot(dx, dy) < PING_WHEEL_INNER) return -1; // 中心死区=取消
+  const deg = ((Math.atan2(dy, dx) * 180) / Math.PI + 90 + 22.5 + 360) % 360;
+  return Math.floor(deg / 45) % 8; // 0=北，顺时针，扇区以罗盘方向为中心
+};
+const pingTriggerMatches = (event: KeyboardEvent) => event.code === PING_WHEEL_TRIGGER.code && event.ctrlKey === PING_WHEEL_TRIGGER.ctrl && event.shiftKey === PING_WHEEL_TRIGGER.shift && event.altKey === PING_WHEEL_TRIGGER.alt && !event.metaKey;
 const contains = (box: Box, x: number, y: number, padding = 0) => x >= box.x - padding && x <= box.x + box.width + padding && y >= box.y - padding && y <= box.y + box.height + padding;
 const overlaps = (a: Box, b: Box) => a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(Math.max(low, high), value));
@@ -203,6 +229,10 @@ export default function SpaceCanvas(props: Props) {
   const closeImageDrawing = () => { setImageDrawing(undefined); setSelectionActivity(false); props.onFocusComposer?.(); };
   const beginImageDrawing = (id:string) => { const item=props.scene.items.find(item=>item.id===id); if(!item||blocked()||drawingSession()||props.scene.run?.status==='running'||!props.onImageDrawingCommand)return; activateItem(id);setImageDrawing({sceneId:props.scene.id,itemId:id,assetId:item.asset.id});setSelectionActivity(true); };
   const [pluginMenu, setPluginMenu] = createSignal<'workflow' | 'ocr' | 'scroll' | 'translation' | 'pin'>();
+  const [pingWheel, setPingWheel] = createSignal<{ x: number; y: number } | null>(null);
+  const [pingSlot, setPingSlot] = createSignal(-1);
+  let pingArmed = false; // 触发键被扣住：按住期间不输入到任何输入框
+  let lastPointer = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
   const [extensionButtonCount, setExtensionButtonCount] = createSignal(0);
   const [extensionInteracting, setExtensionInteracting] = createSignal(false), [extensionRunning, setExtensionRunning] = createSignal(false);
   const [scrollMenuManual, setScrollMenuManual] = createSignal(false);
@@ -423,6 +453,8 @@ export default function SpaceCanvas(props: Props) {
     batch(() => { clearHideTimer(); setActiveItemId(''); setActive(region.id); placeToolbar(region); setToolbarVisible(true); });
   }
   function hover(event: PointerEvent) {
+    lastPointer = { x: event.clientX, y: event.clientY };
+    if (pingWheel()) { setPingSlot(pingPickSlice(event.clientX - pingWheel()!.x, event.clientY - pingWheel()!.y)); return; }
     if (extensionInteracting()) { clearHideTimer(); return; }
     if (event.target instanceof Element && event.target.closest('.selection-code-card')) { clearSnapPreview(); clearHideTimer(); return; }
     updateSnapPreview({ x: event.clientX, y: event.clientY, shiftKey: event.shiftKey });
@@ -498,6 +530,55 @@ export default function SpaceCanvas(props: Props) {
     if (translationEntries().length === 1) runTranslation(translationEntries()[0], region);
     else if (translationEntries().length) { setPluginMenu('translation'); }
   }
+  const pingSlots = () => DEFAULT_PING_WHEEL_SLOTS.map((slot, index) => {
+    const builtin = PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot.action);
+    return { label: slot.action === 'none' ? '' : builtin?.label ?? '▪', title: builtin?.title ?? slot.action, action: slot.action, index };
+  });
+  function pingCancel() {
+    setPingWheel(null);
+    setPingSlot(-1);
+  }
+  function openPingWheel() {
+    const margin = PING_WHEEL_OUTER + 30;
+    const x = clamp(lastPointer.x, margin, Math.max(margin, viewport().width - margin));
+    const y = clamp(lastPointer.y, margin, Math.max(margin, viewport().height - margin));
+    setPingSlot(-1);
+    setPingWheel({ x, y });
+  }
+  function regionAt(x: number, y: number): Region | undefined {
+    const hit = [...props.scene.regions].reverse().find(region => { const reg = regionById(region.id); return reg ? contains(display(reg), x, y, 5) : false; });
+    return hit ? regionById(hit.id)! : undefined;
+  }
+  function runPingSlot(slot: { action: string }, region: Region) {
+    if (slot.action === 'cancel' || slot.action === 'none') return;
+    if (slot.action === 'explain') {
+      const entry = workflowEntries().find(item => item.plugin.manifest.id === 'wsk.ask') ?? workflowEntries()[0];
+      if (entry) runWorkflow(entry, region); else props.onError('没有可用的图像处理插件');
+    } else if (slot.action === 'table') {
+      const entry = workflowEntries().find(item => item.plugin.manifest.id === 'mewu.table');
+      if (entry) runWorkflow(entry, region); else props.onError('未安装表格识别插件');
+    } else if (slot.action === 'translate') {
+      if (translationEntries().length || savedTranslation(region)) translate(region); else props.onError('翻译不可用');
+    } else if (slot.action === 'ocr') {
+      if (ocrEntries().length || savedOcr(region)?.document.lines.length) selectOcr(region); else props.onError('文字识别不可用');
+    } else if (slot.action === 'pin') {
+      const entry = pinEntries()[0];
+      if (entry) void runPin(entry, region); else props.onError('贴图不可用');
+    } else if (slot.action === 'copy') void exportRegion(region, true, false);
+    else if (slot.action === 'save') void exportRegion(region, false, false);
+  }
+  function firePingFromClick(x: number, y: number) {
+    const wheel = pingWheel();
+    if (!wheel) return;
+    const slotIndex = pingPickSlice(x - wheel.x, y - wheel.y);
+    const slot = slotIndex >= 0 ? pingSlots()[slotIndex] : undefined;
+    pingCancel();
+    if (!slot || slot.action === 'cancel' || slot.action === 'none') return; // 点击中心/取消槽=关闭
+    const region = regionAt(wheel.x, wheel.y) ?? activeRegion();
+    if (!region) { props.onError('ping 的位置没有选区，先框选一块内容'); return; }
+    setActive(region.id);
+    runPingSlot(slot, region);
+  }
   function trackPointer(event: PointerEvent, move: (event: PointerEvent) => void, finish: (committed: boolean) => void, sourceCurrent?: () => boolean, preservePendingOutlines = false) {
     ocrRequests.cancel(); props.onTranslationCancel?.(); cancelGesture?.(); event.preventDefault(); event.stopPropagation();
     interactionVersion++;
@@ -525,6 +606,7 @@ export default function SpaceCanvas(props: Props) {
   }
   function begin(event: PointerEvent) {
     if (props.blackboard) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 5); return; }
+    if (pingWheel()) return; // 轮盘打开时不进入框选
     if (event.button !== 0) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 1); return; }
     if (activity()) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 2); return; }
     if (!props.scene.background || backgroundError() || !geometry().width) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 4); return; }
@@ -693,6 +775,21 @@ export default function SpaceCanvas(props: Props) {
       return;
     }
     if (nativeSelectOwnsEscape(event)) return;
+    if (pingWheel()) { // 轮盘打开时独占键盘：Esc 取消，其余按键不落到画布
+      if (event.key === 'Escape') { pingCancel(); pingArmed = false; }
+      event.preventDefault(); event.stopImmediatePropagation();
+      return;
+    }
+    if (pingTriggerMatches(event) && !event.defaultPrevented && !event.isComposing && !event.repeat) {
+      const target = event.target instanceof Element ? event.target : document.activeElement;
+      if (!target?.closest('input,textarea,select,.artifact-card,.ocr-text-layer,.drawing-editor,[contenteditable]:not([contenteditable="false"])') && !document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]') && props.scene.background && !backgroundError() && !drawingSession()) {
+        pingArmed = true;
+        event.preventDefault(); event.stopImmediatePropagation();
+        openPingWheel();
+      }
+    } else if (pingArmed && event.code === PING_WHEEL_TRIGGER.code) { // 扣住：按住期间的重复按键不得输入
+      event.preventDefault(); event.stopImmediatePropagation();
+    }
     const videoItem = props.scene.items.find(item => item.id === activeItemId() && item.asset.kind === 'video');
     if (props.onVideoCopy && videoCopyKey(event, { active: Boolean(videoItem), sceneId: props.scene.id, itemId: videoItem?.id ?? '', focused: document.hasFocus(), selectedText: Boolean(window.getSelection()?.toString()), target: event.target instanceof Element ? event.target : document.activeElement, blocked: activity() || Boolean(drawingSession()) || exporting() || forceNew() || blocked() || Boolean(pluginMenu() || document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]')) })) {
       event.preventDefault(); event.stopImmediatePropagation(); void props.onVideoCopy(videoItem!.id).catch(error => props.onError(error instanceof Error ? error.message : String(error))); return;
@@ -741,7 +838,18 @@ export default function SpaceCanvas(props: Props) {
     else if (['c', 's', 'enter'].includes(event.key.toLowerCase())) { event.preventDefault(); event.stopImmediatePropagation(); if(event.key.toLowerCase()==='s'){const sceneId=props.scene.id,regionId=region.id;revealToolbar(region);queueMicrotask(()=>{if(!disposed&&props.scene.id===sceneId&&activeRegion()?.id===regionId&&!blocked()&&!exporting())openRegionImageExport?.();});}else void exportRegion(region, true, event.key === 'Enter'); }
     else if (!region.imageOverride && captureGrant()) { event.preventDefault(); props.onRecordRegion(region.id); }
   };
-  const releaseKey = (event: KeyboardEvent) => { if (event.key === 'Shift' && snapPointer) updateSnapPreview({ ...snapPointer, shiftKey: false }); if (heldArrows.delete(event.key) && !heldArrows.size) props.geometryController.endKeys(); };
+  const releaseKey = (event: KeyboardEvent) => {
+    if (event.key === 'Shift' && snapPointer) updateSnapPreview({ ...snapPointer, shiftKey: false });
+    if (heldArrows.delete(event.key) && !heldArrows.size) props.geometryController.endKeys();
+    if (event.code === PING_WHEEL_TRIGGER.code && pingArmed) { pingArmed = false; pingCancel(); } // 松开触发键 = 关闭轮盘
+  };
+  const pingPointerDown = (event: PointerEvent) => {
+    if (!pingWheel()) return;
+    event.preventDefault(); event.stopPropagation();
+    if (event.button === 2) { pingCancel(); return; } // 右键取消
+    if (event.button !== 0) return;
+    firePingFromClick(event.clientX, event.clientY); // 点击槽位执行，点中心=关闭
+  };
   const focusReference = (event: Event) => {
     const reference = (event as CustomEvent<Reference>).detail;
     if (reference?.kind === 'item') {
@@ -761,6 +869,7 @@ export default function SpaceCanvas(props: Props) {
   document.addEventListener('mewu:focus-reference', focusReference);
   document.addEventListener('keydown', recordKey, true);
   document.addEventListener('keyup', releaseKey, true);
+  document.addEventListener('pointerdown', pingPointerDown, true);
   document.addEventListener('focusin', snapFocus); document.addEventListener('visibilitychange', snapVisibility);
   onCleanup(() => {
     disposed = true;
@@ -778,6 +887,7 @@ export default function SpaceCanvas(props: Props) {
     document.removeEventListener('mewu:focus-reference', focusReference);
     document.removeEventListener('keydown', recordKey, true);
     document.removeEventListener('keyup', releaseKey, true);
+    document.removeEventListener('pointerdown', pingPointerDown, true);
   });
   createEffect(() => {
     const background = props.scene.background, id = props.scene.id;
@@ -947,6 +1057,24 @@ export default function SpaceCanvas(props: Props) {
     </div>
     <Show when={selectionPreview()}>{box => <div class="capture-selection" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />}</Show>
     <For each={queuedSelectionPreviews()}>{pending => { const box = createMemo(() => display(pending.region)); return <div class="capture-selection" data-pending-selection="queued" aria-hidden="true" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />; }}</For>
+    <Show when={pingWheel()}>{wheel => (
+      <svg class="ping-wheel" width={PING_WHEEL_SIZE} height={PING_WHEEL_SIZE} viewBox={`0 0 ${PING_WHEEL_SIZE} ${PING_WHEEL_SIZE}`} role="menu" aria-label={t('ping 轮盘')} style={{ left: `${wheel().x - PING_WHEEL_SIZE / 2}px`, top: `${wheel().y - PING_WHEEL_SIZE / 2}px` }}>
+        <g transform={`translate(${PING_WHEEL_SIZE / 2} ${PING_WHEEL_SIZE / 2})`}>
+          <For each={pingSlots()}>{slot => (
+            <path class="ping-wedge" classList={{ hot: pingSlot() === slot.index }} d={pingSector(PING_WHEEL_INNER, PING_WHEEL_OUTER, -112.5 + slot.index * 45, -67.5 + slot.index * 45)} />
+          )}</For>
+          <For each={pingSlots()}>{slot => { const [ix, iy] = pingPolar(PING_WHEEL_ICON_R, -90 + slot.index * 45); return (
+            <text class="ping-wedge-icon" classList={{ hot: pingSlot() === slot.index }} x={ix} y={iy + 9}>{slot.label}</text>
+          ); }}</For>
+          <circle class="ping-hub" r={PING_WHEEL_INNER - 8} />
+          <text class="ping-hub-icon" y={6}>✕</text>
+          <Show when={pingSlots()[pingSlot()]} keyed>{slot => { const [lx, ly] = pingPolar(PING_WHEEL_LABEL_R, -90 + slot.index * 45); return (
+            <text class="ping-slice-title" x={lx} y={ly}>{slot.title}</text>
+          ); }}</Show>
+        </g>
+      </svg>
+    )}</Show>
+>>>>>>> bf8ee74 (截图画布 ping 轮盘：按住 G 唤出，移动高亮，点击槽位执行既有动作)
     {/* Native region observation temporarily hides this window and causes blur; keep the invocation owner mounted. */}
     <Show when={(toolbarVisible() || extensionInteracting()) && !drawingSession() && !imageDrawing() && !activity() && !forceNew() && activeRegion()}>{region => <div ref={bindToolbar} class="capture-toolbar" role="toolbar" aria-label={t("截图工具")} style={{ left: `${toolbarBox().x}px`, top: `${toolbarBox().y}px` }} onPointerDown={event => { event.stopPropagation(); if (window.getSelection()?.anchorNode?.parentElement?.closest('.ocr-text-layer')) event.preventDefault(); }} onPointerEnter={clearHideTimer}>
       <Show when={props.aiAvailable !== false}><button data-caption={t("引用")} class="capture-reference" classList={{ 'capture-referenced': referenced(region().id) }} title={referenced(region().id) ? t("已引用") : t("引用当前区域")} aria-label={t("引用当前区域")} disabled={blocked()} onClick={() => { if (!referenced(region().id)) props.onReference({ kind: 'region', id: region().id }); props.onFocusComposer?.(); }}>@</button></Show>
