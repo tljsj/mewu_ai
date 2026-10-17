@@ -112,7 +112,7 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
       const builtin = () => PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot().action);
       const editSlot = (patch: Partial<{ action: string; label: string; icon?: string; skin?: string }>) => {
         const next = Array.from({ length: 8 }, (_, i) => (props.preferences.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS)[i] ?? DEFAULT_PING_WHEEL_SLOTS[i]);
-        next[index] = { action: patch.action ?? next[index].action, label: patch.label !== undefined ? patch.label : next[index].label, ...(patch.icon !== undefined ? { icon: patch.icon } : ('icon' in next[index] ? { icon: next[index].icon } : {})) };
+        next[index] = { action: patch.action ?? next[index].action, label: patch.label !== undefined ? patch.label : next[index].label, ...(patch.icon !== undefined ? { icon: patch.icon } : ('icon' in next[index] ? { icon: next[index].icon } : {})), ...(patch.skin !== undefined ? { skin: patch.skin } : ('skin' in next[index] ? { skin: next[index].skin } : {})) };
         props.onPreferences({ ...props.preferences, pingWheelSlots: next });
       };
       let iconInput: HTMLInputElement | undefined;
