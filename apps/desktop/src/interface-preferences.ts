@@ -37,13 +37,10 @@ export interface Preferences {
   thinkingGlowEnabled?: boolean;
   thinkingGlowColor?: string;
   videoPreviewResolution?: PreviewResolution;
-<<<<<<< HEAD
   pingWheelTrigger?: PingWheelTriggerPref;
   pingWheelSlots?: PingWheelSlotPref[];
-=======
   /** 对话栏常驻：为真时不再因鼠标离开而自动收起 */
   composerAlwaysVisible?: boolean;
->>>>>>> ae7322b (对话栏常驻开关 + 位置记忆：手动放置后新截图在同一位置唤醒（全局记忆，归位即清除）)
 }
 export const preferenceKey = 'mewu.interface.v1';
 export function readPreferences(): Preferences {
