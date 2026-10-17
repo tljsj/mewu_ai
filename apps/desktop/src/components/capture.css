@@ -57,3 +57,5 @@
 .ping-hub{fill:rgba(1,10,19,.85);stroke:#785a28;stroke-width:1.5}
 .ping-hub-icon{fill:#785a28;font:700 16px "Segoe UI",sans-serif;text-anchor:middle}
 .ping-slice-title{fill:#f0e6d2;font:700 15px "Segoe UI",sans-serif;text-anchor:middle;paint-order:stroke;stroke:rgba(1,10,19,.9);stroke-width:4px}
+.ping-trigger-recording{border-color:#f0b429;color:#7a5b0e}
+.ping-slot-label{width:5.5em;margin-left:6px}

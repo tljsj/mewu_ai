@@ -13,6 +13,28 @@ import { Row, Toggle } from './SettingControls';
 import RecordingAudioSettings from './RecordingAudioSettings';
 import SystemCaptureShortcutSetting from './SystemCaptureShortcutSetting';
 import type { PreviewResolution } from '../video-preview';
+import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelTriggerPref } from '../interface-preferences';
+import { PING_WHEEL_BUILTIN_ACTIONS } from './SpaceCanvas';
+
+const PING_WHEEL_DIRECTIONS = ['北', '东北', '东', '东南', '南', '西南', '西', '西北'] as const;
+const formatPingTrigger = (value: PingWheelTriggerPref) => [value.ctrl && 'Ctrl', value.shift && 'Shift', value.alt && 'Alt', value.code.replace(/^Key|^Digit/, '')].filter(Boolean).join(' + ');
+function PingTriggerField(props: { value: PingWheelTriggerPref; onChange: (value: PingWheelTriggerPref) => void }) {
+  const [recording, setRecording] = createSignal(false);
+  const captureKey = (event: KeyboardEvent) => {
+    event.preventDefault(); event.stopPropagation();
+    if (event.key === 'Escape') { stop(); return; }
+    if (event.repeat || event.isComposing || event.metaKey || !/^[a-z0-9]$/i.test(event.key)) return;
+    stop();
+    props.onChange({ code: /^[0-9]$/.test(event.key) ? `Digit${event.key}` : `Key${event.key.toUpperCase()}`, ctrl: event.ctrlKey, shift: event.shiftKey, alt: event.altKey });
+  };
+  const stop = () => { window.removeEventListener('keydown', captureKey, true); setRecording(false); };
+  onCleanup(stop);
+  return <button class="secondary-button" classList={{ 'ping-trigger-recording': recording() }} onClick={() => {
+    if (recording()) { stop(); return; }
+    setRecording(true);
+    window.addEventListener('keydown', captureKey, true);
+  }}>{recording() ? t('按下新按键（Esc 取消）') : formatPingTrigger(props.value)}</button>;
+}
 
 export default function CaptureSettings(props: { active: boolean; preferences: Preferences; onPreferences: (value: Preferences) => void; platform?: SettingsInfo['platform']; api?: SettingsClient }) {
   const api = props.api ?? settingsApi;
@@ -50,6 +72,24 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
     <Show when={props.platform === 'windows'}><SystemCaptureShortcutSetting active={props.active && pane() === 'screenshot'} api={api} /></Show>
     <Row title={t('翻译目标语言')}><select aria-label={t('翻译目标语言')} value={props.preferences.translationLanguage ?? 'zh-Hans'} onChange={event => props.onPreferences({ ...props.preferences, translationLanguage: event.currentTarget.value as TranslationLanguage })}><For each={translationLanguages}>{([language, label]) => <option value={language}>{t(label)}</option>}</For></select></Row>
     <Row title={t("选区外暗度")}><div class="range-field"><input aria-label={t("选区外暗度")} type="range" min=".3" max=".8" step=".01" value={props.preferences.maskOpacity} onInput={event => props.onPreferences({ ...props.preferences, maskOpacity: Number(event.currentTarget.value) })} /><output>{Math.round(props.preferences.maskOpacity * 100)}%</output></div></Row>
+    <Row title={t("ping 轮盘触发键")}><PingTriggerField value={props.preferences.pingWheelTrigger ?? DEFAULT_PING_WHEEL_TRIGGER} onChange={value => props.onPreferences({ ...props.preferences, pingWheelTrigger: value })} /></Row>
+    <For each={Array.from({ length: 8 }, (_, index) => index)}>{index => {
+      const slot = () => (props.preferences.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS)[index] ?? DEFAULT_PING_WHEEL_SLOTS[index];
+      const builtin = () => PING_WHEEL_BUILTIN_ACTIONS.find(entry => entry.action === slot().action);
+      const editSlot = (patch: Partial<{ action: string; label: string }>) => {
+        const next = Array.from({ length: 8 }, (_, i) => (props.preferences.pingWheelSlots ?? DEFAULT_PING_WHEEL_SLOTS)[i] ?? DEFAULT_PING_WHEEL_SLOTS[i]);
+        next[index] = { action: patch.action ?? next[index].action, label: patch.label !== undefined ? patch.label : next[index].label };
+        props.onPreferences({ ...props.preferences, pingWheelSlots: next });
+      };
+      return <Row title={`${t('轮盘槽位')} · ${PING_WHEEL_DIRECTIONS[index]}`}>
+        <select aria-label={`${t('轮盘槽位')} ${PING_WHEEL_DIRECTIONS[index]}`} value={slot().action} onChange={event => editSlot({ action: event.currentTarget.value })}>
+          <For each={PING_WHEEL_BUILTIN_ACTIONS}>{entry => <option value={entry.action}>{t(entry.title)}</option>}</For>
+          <option value="none">{t('空')}</option>
+        </select>
+        <input aria-label={`${t('槽位图标')} ${PING_WHEEL_DIRECTIONS[index]}`} class="ping-slot-label" maxlength="8" placeholder={builtin()?.label ?? t('图标')} value={slot().label ?? ''} onInput={event => editSlot({ label: event.currentTarget.value })} />
+      </Row>;
+    }}</For>
+    <Row title={t("轮盘布局")}><button class="secondary-button" onClick={() => props.onPreferences({ ...props.preferences, pingWheelSlots: [...DEFAULT_PING_WHEEL_SLOTS] })}>{t('恢复默认布局')}</button></Row>
     <Show when={view().values} fallback={<Show when={loading()}><LoaderCircle size={16} class="spin" aria-label={t("加载截图设置")} /></Show>}>
       <Row title={t("延时截图")}><select aria-label={t("延时截图")} value={view().values!.captureDelaySeconds} onChange={event => controller.edit({ captureDelaySeconds: Number(event.currentTarget.value) as 0 | 3 | 5 })}><option value="0">{t("无")}</option><option value="3">{t("3 秒")}</option><option value="5">{t("5 秒")}</option></select></Row>
       <Row title={t("默认图片格式")}><select aria-label={t("默认图片格式")} value={view().values!.defaultImageFormat} onChange={event => controller.edit({ defaultImageFormat: event.currentTarget.value as 'png' | 'jpeg' })}><option value="png">PNG</option><option value="jpeg">JPEG</option></select></Row>
