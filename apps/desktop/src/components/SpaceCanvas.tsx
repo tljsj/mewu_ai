@@ -650,7 +650,8 @@ export default function SpaceCanvas(props: Props) {
     }
     if (pingTriggerMatchesEvent(event) && !event.defaultPrevented && !event.isComposing && !event.repeat) {
       const target = event.target instanceof Element ? event.target : document.activeElement;
-      if (!target?.closest('input,textarea,select,.artifact-card,.ocr-text-layer,.drawing-editor,[contenteditable]:not([contenteditable="false"])') && !document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]') && props.scene.background && !backgroundError() && !drawingSession()) {
+      const bareModifier = /^(Alt|Control|Shift)$/.test(pingTrigger().code); // 裸修饰键不会打进输入框：焦点在输入框时也允许唤出（修复选完区后需先点一下的问题）
+      if ((bareModifier || !target?.closest('input,textarea,select,.artifact-card,.ocr-text-layer,.drawing-editor,[contenteditable]:not([contenteditable="false"])')) && !document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]') && props.scene.background && !backgroundError() && !drawingSession()) {
         pingArmed = true;
         event.preventDefault(); event.stopImmediatePropagation();
         openPingWheel();
