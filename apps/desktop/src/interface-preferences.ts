@@ -39,6 +39,8 @@ export interface Preferences {
   videoPreviewResolution?: PreviewResolution;
   pingWheelTrigger?: PingWheelTriggerPref;
   pingWheelSlots?: PingWheelSlotPref[];
+  /** click = 按住键唤出+点击槽位（默认，无素材）；lol = 长按左键拖动松手触发+标记动画+贴图主题（素材可本地注入） */
+  pingWheelMode?: 'click' | 'lol';
 }
 export const preferenceKey = 'mewu.interface.v1';
 export function readPreferences(): Preferences {
@@ -58,6 +60,7 @@ export function readPreferences(): Preferences {
       thinkingGlowColor: typeof value.thinkingGlowColor === 'string' && /^#[0-9a-f]{6}$/i.test(value.thinkingGlowColor.trim()) ? value.thinkingGlowColor.trim().toUpperCase() : defaults.thinkingGlowColor,
       pingWheelTrigger: validTrigger(value.pingWheelTrigger) ? value.pingWheelTrigger : defaults.pingWheelTrigger,
       pingWheelSlots: validSlots(value.pingWheelSlots),
+      pingWheelMode: value.pingWheelMode === 'lol' ? 'lol' : 'click',
     };
   } catch { return defaults; }
 }
