@@ -54,3 +54,25 @@ export const PING_WHEEL_ICONS: Record<string, string> = pick(PING_WHEEL_ICON_NAM
 export const PING_MARKER_ART: Record<string, string> = pick(PING_MARKER_ART_NAMES, PING_TEXTURES);
 export const PING_VOICES: Record<string, string> = pick(PING_VOICE_NAMES, PING_SOUNDS_LIB);
 export const PING_HUB_ICON: string = PING_TEXTURES['generic_ping'] ?? '';
+
+// 皮肤（LOL ping 预设）：一个皮肤同时确定 轮盘图标 + 落点符号 + 语音 + 颜色。
+// 对应 lolPing 的 ALL_PINGS，另加 target/caution 两个补充皮肤。公开版本库为空时全部字段为空串（退化为默认样式）。
+export interface PingSkin { name: string; icon: string; art: string; voice: string; color: string }
+const skin = (name: string, icon: string, art: string, voice: string, color: string): PingSkin =>
+  ({ name, icon: PING_TEXTURES[icon] ?? '', art: PING_TEXTURES[art] ?? '', voice: PING_SOUNDS_LIB[voice] ?? '', color });
+export const PING_SKINS: Record<string, PingSkin> = {
+  danger: skin('危险', 'pingwheel_retreatrender', 'pingwheel_retreatrender', 'SRP_12', '#ff3b55'),
+  push: skin('推进', 'push', 'pingwheel_pushrender', 'SRP_9', '#35d27a'),
+  omw: skin('在路上', 'omw', 'omw', 'OnMyWay', '#2e8bff'),
+  allin: skin('全押', 'all_in', 'pingwheel_allin_render_01', 'SRP_4', '#f2b320'),
+  assist: skin('求援', 'assist_me', 'assist_me', 'ComeHere', '#56d43c'),
+  needvision: skin('需要视野', 'need_vision', 'need_vision', 'SRP_7', '#56d43c'),
+  missing: skin('敌人失踪', 'enemy_missing', 'enemy_missing', 'MIA', '#f2c518'),
+  enemyvision: skin('敌方视野', 'pingwheel_enemyvisionrender', 'pingwheel_enemyvisionrender', 'AreaIsWarded', '#ff3b55'),
+  generic: skin('通用', 'pingwheel_basicpingrender', 'pingwheel_basicpingrender', 'Base', '#2e8bff'),
+  bait: skin('诱饵', 'pingwheel_baitrender', 'pingwheel_baitrender', 'SRP_11', '#efbc12'),
+  visioncleared: skin('视野已清', 'vision_cleared', 'pingwheel_visionclearedrender', 'SRP_6', '#2b80ff'),
+  missingflip: skin('倒放的问号', 'enemy_missing_flipped', 'enemy_missing_flipped', 'MIA', '#f2c518'),
+  target: skin('目标', 'target', 'target', 'Attack', '#f2b320'),
+  caution: skin('警告', 'caution', 'caution', 'Danger', '#f2c518'),
+};
