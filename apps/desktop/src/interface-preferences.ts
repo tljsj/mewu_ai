@@ -5,7 +5,7 @@ import type { PreviewResolution } from './video-preview';
 /** ping 轮盘触发键：裸修饰键（'Alt'|'Control'|'Shift'，推荐，不与打字冲突），或带至少一个修饰键的字母/数字组合；裸字母/数字会打进输入框，不允许。 */
 export interface PingWheelTriggerPref { code: string; ctrl: boolean; shift: boolean; alt: boolean }
 /** ping 轮盘槽位：方位由数组下标决定（0=北，顺时针），action 见 SpaceCanvas 的动作池，label 为槽位图标文字（可空用默认），icon 为用户自带的图片 data URL（可空，仅存本地偏好，不随源码分发）。 */
-export interface PingWheelSlotPref { action: string; label?: string; icon?: string }
+export interface PingWheelSlotPref { action: string; label?: string; icon?: string; skin?: string }
 export const DEFAULT_PING_WHEEL_TRIGGER: PingWheelTriggerPref = { code: 'Alt', ctrl: false, shift: false, alt: false };
 export const DEFAULT_PING_WHEEL_SLOTS: readonly PingWheelSlotPref[] = [
   { action: 'explain' }, { action: 'pin' }, { action: 'copy' }, { action: 'save' },
@@ -24,6 +24,7 @@ const validSlots = (value: unknown): PingWheelSlotPref[] => {
       action: slot.action,
       ...(typeof slot.label === 'string' && slot.label.trim() && slot.label.length <= 8 ? { label: slot.label.trim() } : {}),
       ...(typeof slot.icon === 'string' && /^data:image\/(png|jpeg|webp);base64,/.test(slot.icon) && slot.icon.length <= 280000 ? { icon: slot.icon } : {}),
+      ...(typeof slot.skin === 'string' && slot.skin.length > 0 && slot.skin.length <= 40 ? { skin: slot.skin } : {}),
     }));
   return [...DEFAULT_PING_WHEEL_SLOTS.map((slot, index) => cleaned[index] ?? slot)];
 };
