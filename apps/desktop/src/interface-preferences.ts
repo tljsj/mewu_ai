@@ -60,11 +60,11 @@ export function readPreferences(): Preferences {
       showButtonLabels: value.showButtonLabels !== false,
       thinkingGlowEnabled: value.thinkingGlowEnabled !== false,
       videoPreviewResolution: [50, 75, 100].includes(value.videoPreviewResolution) ? value.videoPreviewResolution : 100,
+      composerAlwaysVisible: value.composerAlwaysVisible === true,
       thinkingGlowColor: typeof value.thinkingGlowColor === 'string' && /^#[0-9a-f]{6}$/i.test(value.thinkingGlowColor.trim()) ? value.thinkingGlowColor.trim().toUpperCase() : defaults.thinkingGlowColor,
       pingWheelTrigger: validTrigger(value.pingWheelTrigger) ? value.pingWheelTrigger : defaults.pingWheelTrigger,
       pingWheelSlots: validSlots(value.pingWheelSlots),
       pingWheelMode: value.pingWheelMode === 'click' ? 'click' : 'lol', // 本分支默认 LOL 模式（PR 线的 ping-wheel 默认 click）
-      composerAlwaysVisible: value.composerAlwaysVisible === true,
     };
   } catch { return defaults; }
 }
