@@ -12,6 +12,36 @@ use uuid::Uuid;
 const APPLICATION_ID: i64 = 0x4d455755;
 pub(crate) const DB_SCHEMA_VERSION: u32 = 10;
 
+const SNAPSHOT_PADDING_MIN_BYTES: usize = 1024 * 1024;
+const SNAPSHOT_PADDING_BUCKET_BYTES: usize = 64 * 1024;
+
+fn snapshot_padding_bytes(length: usize) -> usize {
+    if length < SNAPSHOT_PADDING_MIN_BYTES {
+        return 0;
+    }
+    let padding = (SNAPSHOT_PADDING_BUCKET_BYTES - length % SNAPSHOT_PADDING_BUCKET_BYTES)
+        % SNAPSHOT_PADDING_BUCKET_BYTES;
+    match length.checked_add(padding) {
+        Some(total) if total <= isize::MAX as usize => padding,
+        _ => 0,
+    }
+}
+
+/// Keep large JSON TEXT records equal-sized within a small bucket. SQLite can
+/// then retain unchanged overflow pages instead of rebuilding the whole cell
+/// for every byte of growth. Only RFC8259 trailing ASCII whitespace is added;
+/// the typed state, SQL UPDATE/CAS, transaction and FULL commit stay unchanged.
+/// First adoption, bucket crossings and edits shifting an earlier suffix can
+/// still rewrite the large record. This is not incremental BLOB I/O.
+fn pad_snapshot_payload(payload: &mut String) {
+    let padding = snapshot_padding_bytes(payload.len());
+    // Optional formatting must not introduce a new business failure if its
+    // bounded extra allocation cannot be reserved. The original JSON is valid.
+    if padding != 0 && payload.try_reserve_exact(padding).is_ok() {
+        payload.extend(std::iter::repeat(' ').take(padding));
+    }
+}
+
 #[path = "agent_cleanup_store.rs"]
 mod agent_cleanup_store;
 #[path = "journal_store.rs"]
@@ -31,6 +61,10 @@ pub(crate) mod history_storage;
 
 #[path = "session_title_store.rs"]
 pub(crate) mod session_title_store;
+
+#[cfg(test)]
+#[path = "store_persistence_timing_tests.rs"]
+mod persistence_observer_tests;
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -103,6 +137,26 @@ pub struct Store {
     state: Snapshot,
     revision: i64,
     geometry_group: Option<crate::geometry_history::ActiveEdit>,
+    persistence_observer: Option<crate::PersistenceObserver>,
+    checkpoint_maintenance: Option<crate::checkpoint_worker::CheckpointWorker>,
+}
+
+/// An owned maintenance drain. The host can request it under its Store lock,
+/// release that lock, and then wait before releasing the storage-root lifetime.
+pub struct CheckpointDrain(Option<crate::checkpoint_worker::CheckpointWorker>);
+impl CheckpointDrain {
+    pub fn wait(mut self) -> bool {
+        self.0.as_mut().is_none_or(|worker| worker.shutdown())
+    }
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Close the extra connection first. The original writer then retains
+        // SQLite's existing last-connection checkpoint/close behavior.
+        if let Some(mut worker) = self.checkpoint_maintenance.take() {
+            worker.shutdown();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +185,40 @@ mod capture_adoption_tests {
         assert_eq!(store.revision,revision+1);
         assert!(next.scenes.iter().all(|scene|scene.background.is_some()));
         assert!(next.scenes.iter().all(|scene|scene.background.as_ref().unwrap().capture_coordinates.is_none()));
+    }
+    #[test]
+    fn screenshot_adoption_preserves_background_run_and_its_original_input() {
+        let mut store = Store::open_in_memory().unwrap();
+        let original = image();
+        let scene_id = store.adopt_capture_background(original.clone()).unwrap().active_scene_id;
+        let region = Region { id: Uuid::new_v4().to_string(), x: 10., y: 12., width: 80., height: 60., ..Region::default() };
+        store.apply(SceneCommand::AddRegion { scene_id: scene_id.clone(), region: region.clone() }).unwrap();
+        store.apply(SceneCommand::SetRefs { scene_id: scene_id.clone(), refs: vec![Reference { kind: ReferenceKind::Region, id: region.id.clone() }] }).unwrap();
+        store.apply(SceneCommand::SetDraft { scene_id: scene_id.clone(), draft: "继续分析原截图".into() }).unwrap();
+        let context = store.begin_run(&scene_id).unwrap();
+        let mut prior = store.scene(&scene_id).unwrap().clone();
+        prior.frozen = true;
+        let revision = store.revision;
+        let incoming = image();
+        let adopted = store.adopt_capture_background(incoming.clone()).unwrap();
+        assert_eq!(store.revision, revision + 1);
+        assert_eq!(adopted.scenes.len(), 2);
+        assert_ne!(adopted.active_scene_id, scene_id);
+        assert_eq!(store.scene(&scene_id).unwrap(), &prior);
+        assert_eq!(store.active_scene().unwrap().background.as_ref(), Some(&incoming));
+        assert!(store.run_is_active(&scene_id, &context.run_id));
+        assert_eq!(context.background.as_ref(), Some(&original));
+        assert_eq!(context.regions, vec![region]);
+        assert_eq!(context.refs, prior.refs);
+        assert_eq!(context.messages, prior.messages);
+        let active = adopted.active_scene_id;
+        store.finish_run(&scene_id, &context.run_id, "原截图分析完成").unwrap();
+        assert_eq!(store.active_scene().unwrap().id, active);
+        let finished = store.scene(&scene_id).unwrap();
+        assert!(finished.frozen);
+        assert_eq!(finished.run.as_ref().unwrap().status, RunStatus::Completed);
+        assert_eq!(finished.messages.last().unwrap().text, "原截图分析完成");
+        assert_eq!(store.active_scene().unwrap().background.as_ref(), Some(&incoming));
     }
 }
 
@@ -204,7 +292,7 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         // Validate/migrate before changing journal mode, so an unknown or
         // malformed database is never converted just by attempting to open it.
-        let store = Self::from_connection(SqlConnection::open(path)?)?;
+        let mut store = Self::from_connection(SqlConnection::open(path)?)?;
         let mode: String = store
             .db
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
@@ -212,6 +300,7 @@ impl Store {
             return Err(invalid("无法启用本机 WAL 存储"));
         }
         store.db.pragma_update(None, "synchronous", "FULL")?;
+        store.resume_checkpoint_maintenance();
         Ok(store)
     }
 
@@ -340,12 +429,80 @@ impl Store {
             state,
             revision,
             geometry_group: None,
+            persistence_observer: None,
+            checkpoint_maintenance: None,
         };
         Ok(store)
     }
 
     pub fn snapshot(&self) -> Snapshot {
         self.state.clone()
+    }
+
+    /// Host opt-in only. Observations contain fixed phases and elapsed times,
+    /// never scene contents, identifiers, paths or persistence configuration.
+    pub fn set_persistence_observer(&mut self, observer: Option<crate::PersistenceObserver>) {
+        self.persistence_observer = observer;
+    }
+
+    /// Stop notifications immediately; waiting on the returned owner may be
+    /// performed outside the host Engine lock. An aborted exit can resume.
+    pub fn pause_checkpoint_maintenance(&mut self) -> CheckpointDrain {
+        if self.checkpoint_maintenance.is_some() {
+            // This is connection policy only. Committed WAL remains FULL.
+            let _ = self.db.pragma_update(None, "wal_autocheckpoint", 1000i64);
+        }
+        let worker = self.checkpoint_maintenance.take();
+        if let Some(worker) = &worker { worker.request_stop(); }
+        CheckpointDrain(worker)
+    }
+
+    /// Opportunistic optimization only. Failure leaves SQLite's original
+    /// default checkpoint policy and does not create a new user-facing error.
+    pub fn resume_checkpoint_maintenance(&mut self) -> bool {
+        if let Some(worker) = &self.checkpoint_maintenance { return worker.is_healthy(); }
+        let start = || -> Option<crate::checkpoint_worker::CheckpointWorker> {
+            let path = std::path::PathBuf::from(self.db.path()?);
+            if path.as_os_str().is_empty() { return None; }
+            let maintenance = Self::open_checkpoint_connection(&path).ok()?;
+            let transaction = rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate).ok()?;
+            // Both connections are already bound before startup. This does not
+            // migrate, recover runs, create a database or periodically reopen.
+            let version: u32 = maintenance.pragma_query_value(None, "user_version", |r| r.get(0)).ok()?;
+            let application: i64 = maintenance.pragma_query_value(None, "application_id", |r| r.get(0)).ok()?;
+            let mode: String = maintenance.pragma_query_value(None, "journal_mode", |r| r.get(0)).ok()?;
+            let identity: (u32, i64) = maintenance.query_row(
+                "SELECT schema_version,revision FROM app_state WHERE id=1", [], |r| Ok((r.get(0)?,r.get(1)?))).ok()?;
+            if version != DB_SCHEMA_VERSION || application != APPLICATION_ID || !mode.eq_ignore_ascii_case("wal")
+                || identity != (SCHEMA_VERSION, self.revision)
+                || !crate::checkpoint_worker::same_file_identity(&self.db, &maintenance, &path).ok()? { return None; }
+            transaction.commit().ok()?;
+            crate::checkpoint_worker::CheckpointWorker::start(maintenance).ok()
+        };
+        let Some(mut worker) = start() else { return false; };
+        if self.db.pragma_update(None, "wal_autocheckpoint", 8192i64).is_err() {
+            worker.shutdown();
+            return false;
+        }
+        worker.notify();
+        self.checkpoint_maintenance = Some(worker);
+        true
+    }
+
+    fn open_checkpoint_connection(path: &Path) -> rusqlite::Result<SqlConnection> {
+        let connection = SqlConnection::open_with_flags(path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        connection.busy_timeout(Duration::ZERO)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        Ok(connection)
+    }
+
+    fn notify_checkpoint_maintenance(&mut self) {
+        if self.checkpoint_maintenance.as_ref().is_some_and(|worker| !worker.notify()) {
+            // Never join on the commit path (the host may hold its Engine).
+            // Retain the failed worker owner for explicit drain/Store Drop.
+            let _ = self.db.pragma_update(None, "wal_autocheckpoint", 1000i64);
+        }
     }
 
     /// Host metadata queries can borrow rows without cloning chat history.
@@ -567,25 +724,7 @@ impl Store {
             }
             SceneCommand::AddRegion { scene_id, region } => {
                 let target = scene_mut(&mut next, &scene_id)?;
-                if region.image_override.is_some() {
-                    return Err(invalid("新选区不能携带替换图片"));
-                }
-                if region.ocr.is_some() {
-                    return Err(invalid("新选区不能携带文字识别结果"));
-                }
-                if region.translation.is_some() {
-                    return Err(invalid("新选区不能携带翻译图层"));
-                }
-                if !region.drawings.is_empty()
-                    || !region.drawing_history.is_empty()
-                    || region.drawing_revision != 0
-                {
-                    return Err(invalid("新选区不能携带绘制历史，请使用绘制命令"));
-                }
-                if target.regions.iter().any(|r| r.id == region.id) {
-                    return Err(invalid("区域 ID 重复"));
-                }
-                target.regions.push(region);
+                add_new_region(target, region)?;
                 touch(target);
             }
             SceneCommand::RemoveRegion {
@@ -751,6 +890,12 @@ impl Store {
                     expected_revision,
                     crate::drawing::Mutation::Remove(drawing_id),
                 )?;
+            }
+            SceneCommand::RemoveDrawings {
+                scene_id, region_id, background_id, expected_revision, drawing_ids,
+            } => {
+                edit_drawing(&mut next, &scene_id, &region_id, &background_id,
+                    expected_revision, crate::drawing::Mutation::RemoveBatch(drawing_ids))?;
             }
             SceneCommand::UpdateDrawings {
                 scene_id,
@@ -1012,6 +1157,32 @@ impl Store {
         Ok(snapshot)
     }
 
+    /// Save one new capture region together with the caller's current reference
+    /// draft. Both become visible in the same durable commit; invalid references
+    /// or a failed write must not leave a partially added region behind.
+    pub fn add_region_with_refs(
+        &mut self,
+        scene_id: &str,
+        region: Region,
+        refs: Vec<Reference>,
+    ) -> Result<Snapshot> {
+        let original = scene(&self.state, scene_id)?;
+        if self.state.active_scene_id != scene_id || original.closed || original.frozen {
+            return Err(invalid("会话已变化"));
+        }
+        if refs.iter().filter(|reference| {
+            reference.kind == ReferenceKind::Region && reference.id == region.id
+        }).count() != 1 {
+            return Err(invalid("新选区必须有唯一引用"));
+        }
+        let mut next = self.state.clone();
+        let target = scene_mut(&mut next, scene_id)?;
+        add_new_region(target, region)?;
+        target.refs = refs;
+        touch(target);
+        self.persist(next)
+    }
+
     pub fn set_background(&mut self, scene_id: &str, asset: Asset) -> Result<Snapshot> {
         validate_background(&asset)?;
         let mut next = self.state.clone();
@@ -1028,8 +1199,9 @@ impl Store {
     pub fn adopt_capture_background(&mut self, asset: Asset) -> Result<Snapshot> {
         validate_background(&asset)?;
         let active = scene(&self.state, &self.state.active_scene_id)?;
-        if is_running(active) { return Err(CoreError::RunInProgress); }
-        let needs_scene = active.closed || active.frozen || active.background.is_some()
+        // Match NewScene: a background run keeps its original scene and input.
+        // Capturing starts a separate scene rather than retargeting that run.
+        let needs_scene = is_running(active) || active.closed || active.frozen || active.background.is_some()
             || !active.messages.is_empty() || !active.items.is_empty() || !active.draft.is_empty();
         let mut next = self.state.clone();
         if needs_scene { create_scene(&mut next)?; }
@@ -2487,12 +2659,16 @@ impl Store {
         mutation: Option<(String, MemoryMutation, Option<MemorySource>)>,
         initial_video: Option<(String, VerifiedVideoRunInput)>,
     ) -> Result<Snapshot> {
+        use crate::{persistence_timing::Observation, PersistencePhase};
+        let mut observation=Observation::start(self.persistence_observer);
         let source_set_changed = self
             .geometry_group
             .as_ref()
             .is_some_and(|group| group.source_set_changed(&self.state, &next));
         crate::geometry_history::cleanup(&self.state, &mut next)?;
+        observation.mark(PersistencePhase::GeometryCleanup);
         validate_snapshot(&next)?;
+        observation.mark(PersistencePhase::ValidateCandidate);
         let transaction = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2514,13 +2690,18 @@ impl Store {
         if let Some((run_id, input)) = initial_video {
             crate::video_annotations::register_input(&transaction, &mut next, &run_id, input)?;
         }
+        observation.mark(PersistencePhase::TransactionAndLedger);
         validate_snapshot(&next)?;
+        observation.mark(PersistencePhase::ValidateReconciled);
         next.memories.clear();
         crate::rich_annotations::validate(&transaction, &next)?;
         crate::video_registered_layouts::validate(&transaction, &next)?;
         crate::video_annotations::validate_ledger(&transaction, &next)?;
         next.memory_stats = crate::memory::stats(&transaction, &next)?;
-        let payload = serde_json::to_string(&next)?;
+        observation.mark(PersistencePhase::ValidateLedgers);
+        let mut payload = serde_json::to_string(&next)?;
+        pad_snapshot_payload(&mut payload);
+        observation.mark(PersistencePhase::Serialize);
         let changed = transaction.execute(
             "UPDATE app_state SET payload = ?1, revision = revision + 1 WHERE id = 1 AND revision = ?2 AND schema_version = 1",
             params![payload, self.revision],
@@ -2528,7 +2709,10 @@ impl Store {
         if changed != 1 {
             return Err(CoreError::ConcurrentModification);
         }
+        observation.mark(PersistencePhase::SqlUpdate);
         transaction.commit()?;
+        observation.mark(PersistencePhase::DurableCommit);
+        self.notify_checkpoint_maintenance();
         self.revision += 1;
         self.state = next;
         if source_set_changed
@@ -2539,9 +2723,21 @@ impl Store {
         {
             self.geometry_group = None;
         }
-        Ok(self.state.clone())
+        observation.mark(PersistencePhase::AdoptState);
+        let snapshot=self.state.clone();
+        observation.mark(PersistencePhase::CloneResult);
+        observation.finish();
+        Ok(snapshot)
     }
 }
+
+#[cfg(test)]
+#[path = "checkpoint_store_tests.rs"]
+mod checkpoint_store_tests;
+
+#[cfg(test)]
+#[path = "store_payload_tests.rs"]
+mod payload_tests;
 
 fn initial_snapshot() -> Snapshot {
     let agent = AgentProfile {
@@ -3065,6 +3261,29 @@ pub(crate) fn now() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+fn add_new_region(target: &mut Scene, region: Region) -> Result<()> {
+    if region.image_override.is_some() {
+        return Err(invalid("新选区不能携带替换图片"));
+    }
+    if region.ocr.is_some() {
+        return Err(invalid("新选区不能携带文字识别结果"));
+    }
+    if region.translation.is_some() {
+        return Err(invalid("新选区不能携带翻译图层"));
+    }
+    if !region.drawings.is_empty()
+        || !region.drawing_history.is_empty()
+        || region.drawing_revision != 0
+    {
+        return Err(invalid("新选区不能携带绘制历史，请使用绘制命令"));
+    }
+    if target.regions.iter().any(|r| r.id == region.id) {
+        return Err(invalid("区域 ID 重复"));
+    }
+    target.regions.push(region);
+    Ok(())
+}
+
 fn touch(scene: &mut Scene) {
     scene.updated_at = now().max(scene.updated_at);
 }

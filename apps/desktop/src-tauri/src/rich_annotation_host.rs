@@ -345,7 +345,19 @@ pub async fn copy_drawing_table(
 }
 
 #[tauri::command]
-pub fn apply_drawing_document(
+pub async fn apply_drawing_document(
+    app: AppHandle,
+    window: WebviewWindow,
+    command: SceneCommand,
+) -> Result<crate::HostSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        apply_drawing_document_blocking(app, window, command)
+    })
+    .await
+    .map_err(|_| "图层更新中断")?
+}
+
+fn apply_drawing_document_blocking(
     app: AppHandle,
     window: WebviewWindow,
     command: SceneCommand,
@@ -358,8 +370,16 @@ pub fn apply_drawing_document(
     let mut engine = host.lock()?;
     crate::ensure_scene_command_admission(&app, &host, window.label(), &command, Some(&engine.store))?;
     crate::optional_capabilities::authoring_command(&engine, &command)?;
-    let snapshot = engine.store.snapshot();
     match &command {
+        SceneCommand::RemoveDrawings { scene_id, region_id, drawing_ids, .. } => {
+            let scene = engine.store.scene(scene_id).map_err(|error| error.to_string())?;
+            let region = scene.regions.iter().find(|region| &region.id == region_id).ok_or("选区不存在")?;
+            if !drawing_ids.iter().any(|id| region.drawings.iter().any(|drawing| &drawing.id == id && drawing.kind == DrawingKind::Rich)) {
+                return Err("此入口仅移除已有富图层".into());
+            }
+            // Core validates every ID and performs the entire mixed batch,
+            // including linked repairs, as one revision and one undo step.
+        }
         SceneCommand::UpdateDrawings { .. } => { /* Core validates the entire geometry-only batch and immutable references. */
         }
         SceneCommand::UpdateDrawing {
@@ -368,11 +388,7 @@ pub fn apply_drawing_document(
             drawing,
             ..
         } => {
-            let scene = snapshot
-                .scenes
-                .iter()
-                .find(|s| &s.id == scene_id)
-                .ok_or("会话不存在")?;
+            let scene = engine.store.scene(scene_id).map_err(|e| e.to_string())?;
             let region = scene
                 .regions
                 .iter()
@@ -396,11 +412,7 @@ pub fn apply_drawing_document(
             drawing_id,
             ..
         } => {
-            let scene = snapshot
-                .scenes
-                .iter()
-                .find(|s| &s.id == scene_id)
-                .ok_or("会话不存在")?;
+            let scene = engine.store.scene(scene_id).map_err(|e| e.to_string())?;
             let region = scene
                 .regions
                 .iter()
@@ -420,5 +432,5 @@ pub fn apply_drawing_document(
     let next = engine.store.apply(command).map_err(|e| e.to_string())?;
     engine.ocr_jobs.reconcile(&next);
     engine.translation_jobs.reconcile(&next);
-    Ok(crate::publish(&app, &next))
+    Ok(crate::publish_owned(&app, next))
 }

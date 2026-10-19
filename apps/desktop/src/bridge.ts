@@ -6,7 +6,7 @@ import { normalizeConnectionPath, validateConnectionProfile } from './connection
 import type { ExitPreparationCanceled, ExitPreparationRequest, ExitPreparationResult } from './exit-preparation';
 import { browserMosaicPreview, MosaicPreviewCache, type MosaicPreview } from './mosaic-preview';
 import type { HighlightPreview } from './highlight-preview';
-import type { Region } from './contracts';
+import type { ImageExportVariant, Reference, Region } from './contracts';
 import { highlightCrop, highlightSourceIdentity, highlightTarget } from './highlight-source';
 import { emptyGeometryHistory, PreviewGeometryHistory } from './region-geometry-history';
 import { IMPORT_ACCEPT, prepareImportFiles } from './asset-import';
@@ -14,6 +14,8 @@ import type { RecordingAudioMode, RecordingAudioSelection, RecordingGrant } from
 import type { PluginManifest } from './plugin-contracts';
 import { bundledProviderPresets } from './provider-presets';
 import type { CaptureBackgroundReady } from './capture-presentation';
+import * as capturePerformance from './capture-performance';
+import { startDrawingDiagnostics } from './drawing-diagnostics';
 
 export const native = isTauri();
 export async function captureBackgroundReady(ready: CaptureBackgroundReady): Promise<boolean> {
@@ -50,7 +52,7 @@ export interface RecordingStatus {
   audio: RecordingAudioMode;
 }
 export type RecordingAction = 'pause' | 'resume' | 'stop' | 'cancel';
-interface RuntimeInfo { platform: 'windows' | 'macos' | 'linux' | 'other'; hotkey: string; captureBackend: string; contentOrigin: string }
+interface RuntimeInfo { platform: 'windows' | 'macos' | 'linux' | 'other'; hotkey: string; captureBackend: string; contentOrigin: string; measureInteractions?: boolean }
 let runtime: RuntimeInfo | undefined;
 let runtimeRequest: Promise<RuntimeInfo> | undefined;
 const uid = () => crypto.randomUUID();
@@ -97,6 +99,94 @@ function normalizeSnapshot(snapshot: Snapshot): Snapshot {
 async function invokeSnapshot(command: string, args?: Record<string, unknown>): Promise<Snapshot> {
   return normalizeSnapshot(await invoke<Snapshot>(command, args));
 }
+
+// A full query uses Tauri's existing optimized invoke response. Keep only its
+// live promise; explicit reads after completion must still recover equal-revision
+// state. No cache of scene history, no polling and no render/ACK shortcut.
+let nativeSnapshotRequest: { epoch: object; promise: Promise<Snapshot> } | undefined;
+let nativeSnapshotNoticeEpoch: object = {};
+let nativeSnapshotKnownRevision = 0;
+let snapshotMeasurementConsumers = 0;
+function queryNativeSnapshot(): { epoch: object; promise: Promise<Snapshot> } {
+  if (nativeSnapshotRequest) return nativeSnapshotRequest;
+  const epoch = nativeSnapshotNoticeEpoch;
+  const request = Promise.resolve().then(() => invoke<Snapshot>('get_snapshot')).then(raw => {
+    let measurement: object | undefined;
+    try { if (snapshotMeasurementConsumers > 0) measurement = capturePerformance.captureSnapshotReceived?.(raw); } catch { /* Advisory only. */ }
+    const next = normalizeSnapshot(raw);
+    try { capturePerformance.captureSnapshotNormalized?.(measurement); } catch { /* Advisory only. */ }
+    return next;
+  });
+  const flight = { epoch, promise: request.finally(() => { if (nativeSnapshotRequest === flight) nativeSnapshotRequest = undefined; }) };
+  nativeSnapshotRequest = flight;
+  return flight;
+}
+async function readNativeSnapshot(): Promise<Snapshot> {
+  const requiredEpoch = nativeSnapshotNoticeEpoch;
+  const flight = queryNativeSnapshot();
+  const next = await flight.promise;
+  // A call made after a notice must not inherit a query begun before that
+  // notice. Join one fresh query after it settles; no revision-based cache or
+  // rejection of explicit equal-revision restoration is introduced.
+  return flight.epoch === requiredEpoch ? next : queryNativeSnapshot().promise;
+}
+
+/** Each targeted subscription stores only its newest required revision. The
+ * authoritative full query and App's existing accept/domain witness own state. */
+class SnapshotNoticePump {
+  private wanted = 0;
+  private delivered = 0;
+  private reading = false;
+  private stopped = false;
+  private retry = 0;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  constructor(private readonly read: () => Promise<Snapshot>,
+    private readonly accept: (value: Snapshot) => void, private readonly error: (message: string) => void) {}
+  notice(value: unknown): void {
+    if (this.stopped || !value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).length !== 1 || !('revision' in value)
+      || !Number.isSafeInteger(value.revision) || (value.revision as number) < 1) return;
+    const revision = value.revision as number;
+    if (revision <= this.delivered) return; // Only this subscription's already delivered invalidation.
+    if (revision > nativeSnapshotKnownRevision) {
+      nativeSnapshotKnownRevision = revision; nativeSnapshotNoticeEpoch = {};
+    }
+    if (revision > this.wanted) { this.wanted = revision; this.retry = 0; }
+    if (!this.reading && this.timer === undefined) void this.drain();
+  }
+  dispose(): void {
+    if (this.stopped) return;
+    this.stopped = true; clearTimeout(this.timer); this.timer = undefined;
+  }
+  private async drain(): Promise<void> {
+    if (this.stopped || this.reading) return;
+    this.reading = true;
+    let stale = 0;
+    try {
+      while (!this.stopped && this.wanted > this.delivered) {
+        const next = await this.read();
+        if (this.stopped) return;
+        if (!Number.isSafeInteger(next.revision) || next.revision! < 0) throw Error('空间状态回执无效');
+        // Keep making progress while writers publish faster than reads.
+        // App's existing fence and domain witness decide whether this complete
+        // authoritative state satisfies a command; wanted remains queued.
+        if (next.revision! > this.delivered) {
+          this.accept(next);
+          this.delivered = next.revision!;
+          stale = 0; this.retry = 0;
+        } else if (++stale > 1) throw Error('未收到空间状态，请重试');
+      }
+    } catch (error) {
+      if (this.stopped) return;
+      try { this.error(error instanceof Error ? error.message : String(error)); } catch { /* A UI error handler cannot leak this task. */ }
+      // One bounded recovery attempt. A later notice or ordinary getSnapshot can
+      // always recover; repeated failure never creates an unbounded retry loop.
+      if (this.retry++ < 1) this.timer = setTimeout(() => {
+        this.timer = undefined; if (!this.stopped) void this.drain();
+      }, 50);
+    } finally { this.reading = false; }
+  }
+}
 export async function continueRunFromJournal(input: import('./journal-contracts').ContinueFromRecord): Promise<Snapshot> {
   if (!native) throw new Error('请在桌面版继续回答');
   return invokeSnapshot('continue_run_from_journal', { ...input });
@@ -129,15 +219,17 @@ export function documentUrl(asset: Asset): string {
   if (!runtime?.contentOrigin) throw new Error('内容服务尚未就绪');
   return `${runtime.contentOrigin}/${encodeURIComponent(asset.id)}`;
 }
-export async function exportRegion(sceneId: string, regionId: string, clipboard: boolean): Promise<boolean> {
+export async function exportRegion(sceneId: string, regionId: string, clipboard: boolean, variant?: ImageExportVariant): Promise<boolean> {
   if (!native) throw new Error('此操作需要桌面应用');
-  const result = await invoke<boolean>('export_region', { sceneId, regionId, clipboard });
+  if (variant !== undefined && variant !== 'annotated' && variant !== 'original') throw Error('图片导出版本无效');
+  const result = await invoke<boolean>('export_region', { sceneId, regionId, clipboard, variant: clipboard ? 'annotated' : variant ?? 'annotated' });
   if (typeof result !== 'boolean') throw new Error('图片导出结果无效');
   return result;
 }
-export async function exportImageItem(sceneId: string, itemId: string, sourceAssetId: string, clipboard: boolean): Promise<boolean> {
+export async function exportImageItem(sceneId: string, itemId: string, sourceAssetId: string, clipboard: boolean, variant?: ImageExportVariant): Promise<boolean> {
   if (!native) throw Error('此操作需要桌面应用');
-  const result = await invoke<boolean>('export_image_item', { sceneId, itemId, sourceAssetId, clipboard });
+  if (variant !== undefined && variant !== 'annotated' && variant !== 'original') throw Error('图片导出版本无效');
+  const result = await invoke<boolean>('export_image_item', { sceneId, itemId, sourceAssetId, clipboard, variant: clipboard ? 'annotated' : variant ?? 'annotated' });
   if (typeof result !== 'boolean') throw Error('图片导出结果无效');
   return result;
 }
@@ -217,7 +309,7 @@ export async function subscribeRecording(onStatus: (status: RecordingStatus | nu
 export async function getSnapshot(): Promise<Snapshot> {
   if (!native) return clone();
   await runtimeInfo();
-  return invokeSnapshot('get_snapshot');
+  return readNativeSnapshot();
 }
 
 export async function applyCommand(command: SceneCommand): Promise<Snapshot> {
@@ -391,6 +483,24 @@ export async function captureScreen(): Promise<Snapshot> {
   if (native) return invokeSnapshot('capture_screen');
   throw new Error('浏览器预览不支持截屏');
 }
+/** The native command publishes one authoritative snapshot and returns only its
+ * revision; callers await that publication instead of copying all history twice. */
+export async function addCaptureRegion(sceneId: string, backgroundId: string, region: Region, refs: Reference[]): Promise<number | undefined> {
+  if (native) return invoke<number>('add_capture_region', { sceneId, backgroundId, region, refs });
+  const scene = findScene(sceneId);
+  if (preview.activeSceneId !== sceneId || scene.closed || scene.frozen || scene.background?.id !== backgroundId
+    || scene.regions.some(value => value.id === region.id)
+    || refs.filter(ref => ref.kind === 'region' && ref.id === region.id).length !== 1) throw Error('截图已变化');
+  const next = structuredClone(region);
+  if (next.imageOverride || next.ocr || next.translation || next.drawings?.length
+    || next.drawingRevision || next.drawingHistory?.undo.length || next.drawingHistory?.redo.length) throw Error('选区无效');
+  if (refs.some(ref => ref.kind === 'region' ? ref.id !== next.id && !scene.regions.some(value => value.id === ref.id)
+    : !scene.items.some(value => value.id === ref.id))) throw Error('引用无效');
+  previewGeometry.invalidate(scene);
+  scene.regions.push(next); scene.refs = structuredClone(refs);
+  publish();
+  return undefined;
+}
 export async function createBlackboard(sceneId:string):Promise<Snapshot> {
   if(native)return invokeSnapshot('create_blackboard',{sceneId});
   const original=findScene(sceneId);
@@ -464,6 +574,12 @@ export async function previewDrawingCommand(command:DrawingCommand):Promise<Snap
     }).sort((a,b)=>b.index-a.index);
     for(const {index,old,values} of operations){if(values.length===1&&JSON.stringify(values[0])===JSON.stringify(old))continue;batch.push({index,before:structuredClone(old),after:null});for(let i=0;i<values.length;i++)batch.push({index:index+i,before:null,after:values[i]});}
     if(!batch.length)return clone();
+    for(const edit of batch)apply(edit,true);history.undo.push({batch});history.redo=[];if(history.undo.length>128)history.undo.shift();
+  }else if(command.type==='remove_drawings'){
+    if(!command.drawingIds.length||command.drawingIds.length>256||new Set(command.drawingIds).size!==command.drawingIds.length)throw Error('删除批次无效');
+    const selected=new Set(command.drawingIds);
+    for(const id of selected){const drawing=drawings.find(d=>d.id===id);if(!drawing)throw Error('绘制对象已不存在');if(drawing.rich?.kind==='repair')throw Error('背景修补只能随历史撤销');}
+    const batch:DrawingEdit[]=drawings.flatMap((drawing,index)=>selected.has(drawing.id)||Boolean(drawing.rich?.parentId&&selected.has(drawing.rich.parentId))?[{index,before:structuredClone(drawing),after:null}]:[]).reverse();
     for(const edit of batch)apply(edit,true);history.undo.push({batch});history.redo=[];if(history.undo.length>128)history.undo.shift();
   }else if(command.type==='update_drawings'){
     const batch=command.drawings.map(drawing=>{const index=drawings.findIndex(d=>d.id===drawing.id);if(index<0)throw Error('绘制对象不存在');return {index,before:structuredClone(drawings[index]),after:structuredClone(drawing)};});
@@ -626,10 +742,11 @@ export async function sendMessage(sceneId: string, visualAnnotations?: VisualAnn
   if (native) return invokeSnapshot('send_message', { sceneId, visualAnnotations: visualAnnotations ?? null, regionId: regionId ?? null });
   throw new Error('浏览器预览不连接模型，请在桌面应用发送');
 }
-export async function cancelRun(sceneId: string): Promise<Snapshot> {
-  if (native) return invokeSnapshot('cancel_run', { sceneId });
+export async function cancelRun(sceneId: string, expectedRunId: string): Promise<Snapshot> {
+  if (native) return invokeSnapshot('cancel_run', { sceneId, expectedRunId });
   const scene = findScene(sceneId);
-  if (scene.run?.status === 'running') scene.run.status = 'canceled';
+  if (scene.run?.id !== expectedRunId || scene.run.status !== 'running') throw new Error('运行已取消、结束或被替换，拒绝迟到结果');
+  scene.run.status = 'canceled';
   return publish();
 }
 export async function hideSpace(): Promise<void> {
@@ -656,6 +773,7 @@ export async function runtimeInfo(): Promise<RuntimeInfo> {
       const origin = new URL(info.contentOrigin);
       if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || !origin.port || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) throw new Error('内容服务地址无效');
       runtime = { ...info, platform, contentOrigin: origin.origin };
+      try { capturePerformance.configureCapturePerformance?.(info.measureInteractions === true); } catch { /* Advisory only. */ }
       return runtime;
     }).catch(error => {
       runtimeRequest = undefined;
@@ -676,10 +794,24 @@ export async function exportSnapshot(): Promise<void> {
 export async function subscribe(onSnapshot: (snapshot: Snapshot) => void, onRun: (event: RunEvent) => void, onError: (message: string) => void, surface: 'space' | 'settings' = 'space'): Promise<() => void> {
   if (!native) { snapshotListeners.add(onSnapshot); return () => snapshotListeners.delete(onSnapshot); }
   // Events can arrive before getSnapshot resolves; prepare document URLs first.
-  await runtimeInfo();
+  const info = await runtimeInfo();
+  const stopDrawingDiagnostics = surface === 'space' && info.measureInteractions === true
+    ? startDrawingDiagnostics(true, payload => invoke('record_drawing_diagnostics', { payload })) : undefined;
   // Tauri's default Any target also receives events sent to other windows.
   // Run fragments are emitted separately to space and the minimized-scene widget.
-  const stopSnapshot = await listen<Snapshot>('snapshot', event => onSnapshot(normalizeSnapshot(event.payload)), { target: surface });
+  const publication = new SnapshotNoticePump(getSnapshot, onSnapshot, onError);
+  let snapshotStopped = false;
+  if (surface === 'space') snapshotMeasurementConsumers++;
+  let unlistenSnapshot: (() => void) | undefined;
+  const stopSnapshot = () => {
+    if (snapshotStopped) return;
+    snapshotStopped = true; publication.dispose(); stopDrawingDiagnostics?.();
+    if (surface === 'space') snapshotMeasurementConsumers--;
+    unlistenSnapshot?.();
+  };
+  try {
+    unlistenSnapshot = await listen<unknown>('snapshot-revision', event => publication.notice(event.payload), { target: surface });
+  } catch (error) { stopSnapshot(); throw error; }
   try {
     const stopRun = await listen<RunEvent>('run-event', event => onRun(event.payload), { target: surface });
     try {

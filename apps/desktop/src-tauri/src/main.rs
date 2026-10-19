@@ -4,6 +4,9 @@ mod agent_loop;
 mod agent_tools;
 mod ai;
 mod inline_reasoning;
+mod interaction_performance;
+mod drawing_diagnostics;
+mod run_cancellation;
 mod asset_host;
 mod asset_locations;
 mod assets;
@@ -50,6 +53,8 @@ mod capture_wayland_portal;
 mod recording_portal_linux;
 #[cfg(target_os = "linux")]
 mod recording_pipewire_linux;
+#[cfg(target_os = "linux")]
+mod recording_tray_linux;
 #[cfg(any(target_os = "linux", test))]
 mod window_actions_linux;
 #[cfg(target_os = "linux")]
@@ -174,6 +179,7 @@ mod startup_windows;
 #[cfg(any(target_os = "linux", test))]
 mod startup_webviews;
 mod system_preferences;
+mod system_capture_shortcut;
 mod storage_cli;
 mod storage_dependencies;
 mod storage_host;
@@ -209,6 +215,7 @@ mod video_vector_raster;
 mod visual_annotation_host;
 mod visual_annotation_input;
 mod web_link_host;
+mod window_creation_error;
 mod window_snap;
 
 use mewu_core::{
@@ -287,24 +294,50 @@ pub(crate) struct Host {
 /// window enumeration occurs here. A capture publishes its new background while
 /// still hidden, so visibility/capture guards would lose that first map load.
 #[tauri::command]
-fn get_window_snap_map(
+async fn get_window_snap_map(
+    app: AppHandle,
     window: tauri::WebviewWindow,
-    host: tauri::State<'_, Host>,
     scene_id: String,
     background_id: String,
 ) -> Result<Option<window_snap::FrameSnapMap>, String> {
-    if window.label() != "space" {
-        return Err("此窗口不能读取截图选区".into());
-    }
-    host.exit.ensure_running()?;
-    let engine = host.lock()?;
-    let background = engine
-        .store
-        .active_background_for_preview(&scene_id, &background_id)
-        .map_err(|error| error.to_string())?;
-    let result = host.window_snap.get(&background);
-    host.exit.ensure_running()?;
-    Ok(result)
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<Host>();
+        get_window_snap_map_blocking(window, &host, scene_id, background_id)
+    })
+    .await
+    .map_err(|_| "截图选区读取中断".to_string())?
+}
+
+fn get_window_snap_map_blocking(
+    window: tauri::WebviewWindow,
+    host: &Host,
+    scene_id: String,
+    background_id: String,
+) -> Result<Option<window_snap::FrameSnapMap>, String> {
+    use interaction_performance::{Kind, Stage, Trace};
+    let mut timing = Trace::start(Kind::WindowSnap);
+    timing.mark(Stage::SnapGet);
+    let result = (|| {
+        if window.label() != "space" {
+            return Err("此窗口不能读取截图选区".into());
+        }
+        host.exit.ensure_running()?;
+        let engine = host.lock()?;
+        let background = engine
+            .store
+            .active_background_for_preview(&scene_id, &background_id)
+            .map_err(|error| error.to_string())?;
+        let result = host.window_snap.get(&background);
+        host.exit.ensure_running()?;
+        Ok(result)
+    })();
+    timing.mark(match &result {
+        Ok(Some(_)) => Stage::SnapAvailable,
+        Ok(None) => Stage::SnapMissing,
+        Err(_) => Stage::SnapDenied,
+    });
+    timing.finish(matches!(&result, Ok(Some(_))));
+    result
 }
 impl Host {
     fn lock(&self) -> Result<MutexGuard<'_, Engine>, String> {
@@ -319,11 +352,21 @@ pub(crate) struct HostSnapshot {
     snapshot: Snapshot,
     revision: u64,
 }
+// Internal invalidation only. Full Snapshot/get_snapshot contracts stay unchanged.
+#[derive(Clone, Serialize)]
+struct SnapshotNotice {
+    revision: u64,
+}
 fn emit_run_event(app: &AppHandle, value: serde_json::Value) -> tauri::Result<()> {
     app.emit_to("space", "run-event", &value)?;
     app.emit_to(frozen::LABEL, "run-event", &value)
 }
 fn publish(app: &AppHandle, snapshot: &Snapshot) -> HostSnapshot {
+    publish_owned(app, snapshot.clone())
+}
+fn publish_owned(app: &AppHandle, owned: Snapshot) -> HostSnapshot {
+    let mut timing = interaction_performance::Trace::start(interaction_performance::Kind::Publish);
+    let snapshot = &owned;
     #[cfg(target_os="linux")]
     recording_wayland_host::reconcile(snapshot);
     app.state::<Host>().session_titles.reconcile(snapshot);
@@ -333,13 +376,17 @@ fn publish(app: &AppHandle, snapshot: &Snapshot) -> HostSnapshot {
     image_host::reconcile(app, snapshot);
     pixel_sampler::reconcile(app, snapshot);
     pin_host::reconcile(app, snapshot);
+    timing.mark(interaction_performance::Stage::Validated);
     let revision = app.state::<Host>().revision.fetch_add(1, Ordering::AcqRel) + 1;
     let snapshot = HostSnapshot {
-        snapshot: snapshot.clone(),
+        snapshot: owned,
         revision,
     };
-    let _ = app.emit_to("space", "snapshot", &snapshot);
-    let _ = app.emit_to("settings", "snapshot", &snapshot);
+    let notice = SnapshotNotice { revision };
+    let _ = app.emit_to("space", "snapshot-revision", &notice);
+    if app.get_webview_window("settings").is_some() {
+        let _ = app.emit_to("settings", "snapshot-revision", &notice);
+    }
     // A completed background run updates the small widget without showing or focusing it.
     let _ = app.emit_to(
         frozen::LABEL,
@@ -347,6 +394,8 @@ fn publish(app: &AppHandle, snapshot: &Snapshot) -> HostSnapshot {
         frozen::snapshot(&snapshot.snapshot, revision),
     );
     frozen::reconcile(app, &snapshot.snapshot);
+    timing.mark(interaction_performance::Stage::Emitted);
+    timing.finish(true);
     snapshot
 }
 fn show(app: &AppHandle) {
@@ -370,7 +419,16 @@ fn show(app: &AppHandle) {
 }
 
 #[tauri::command]
-fn get_snapshot(app: AppHandle, host: tauri::State<'_, Host>) -> Result<HostSnapshot, String> {
+async fn get_snapshot(app: AppHandle) -> Result<HostSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<Host>();
+        get_snapshot_blocking(app.clone(), &host)
+    })
+    .await
+    .map_err(|_| "空间状态读取中断".to_string())?
+}
+
+fn get_snapshot_blocking(app: AppHandle, host: &Host) -> Result<HostSnapshot, String> {
     if host.legacy_import_warning.swap(false, Ordering::AcqRel) {
         let _ = app.emit_to("space", "host-error", "部分旧版连接未导入，请检查连接设置");
     }
@@ -457,6 +515,7 @@ async fn apply_scene_command(
         | SceneCommand::UpdateDrawings { .. }
         | SceneCommand::EraseDrawingStrokes { .. }
         | SceneCommand::RemoveDrawing { .. }
+        | SceneCommand::RemoveDrawings { .. }
         | SceneCommand::UndoDrawing { .. }
         | SceneCommand::RedoDrawing { .. } => return Err("请从绘制工具操作".into()),
         command => command,
@@ -488,7 +547,40 @@ async fn apply_scene_command(
         });
     }
     cancel_ended_runs(&mut engine, &snapshot);
-    Ok(publish(&app, &snapshot))
+    Ok(publish_owned(&app, snapshot))
+}
+
+/// One durable capture operation, one full snapshot publication. The invoke
+/// reply only identifies that publication instead of sending all history twice.
+#[tauri::command]
+async fn add_capture_region(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    scene_id: String,
+    background_id: String,
+    region: mewu_core::Region,
+    refs: Vec<mewu_core::Reference>,
+) -> Result<u64, String> {
+    if window.label() != "space" {
+        return Err("此窗口不能添加截图选区".into());
+    }
+    let mut timing = interaction_performance::Trace::start(interaction_performance::Kind::AddRegion);
+    let host = app.state::<Host>();
+    let command = SceneCommand::AddRegion { scene_id: scene_id.clone(), region: region.clone() };
+    ensure_scene_command_admission(&app, &host, window.label(), &command, None)?;
+    let _plugins = host.plugins.lock().map_err(|_| "插件状态不可用")?;
+    let mut engine = host.lock()?;
+    ensure_scene_command_admission(&app, &host, window.label(), &command, Some(&engine.store))?;
+    optional_capabilities::authoring_command(&engine, &command)?;
+    engine.store.active_background_for_preview(&scene_id, &background_id).map_err(|error| error.to_string())?;
+    timing.mark(interaction_performance::Stage::Validated);
+    let snapshot = engine.store.add_region_with_refs(&scene_id, region, refs).map_err(|error| error.to_string())?;
+    timing.mark(interaction_performance::Stage::Applied);
+    cancel_ended_runs(&mut engine, &snapshot);
+    let published = publish_owned(&app, snapshot);
+    timing.mark(interaction_performance::Stage::Published);
+    timing.finish(true);
+    Ok(published.revision)
 }
 
 fn ensure_scene_command_source(owner: &str, command: &SceneCommand) -> Result<(), String> {
@@ -803,10 +895,15 @@ async fn close_scene_window(app: AppHandle, scene_id: String) -> Result<HostSnap
     let host = app.state::<Host>();
     let _transition = begin_explicit_space_transition(&app, &host).await?;
     recording::ensure_idle(&app)?;
-    let (was_active, has_frozen) = {
+    let (was_active, has_frozen, published) = {
         let mut engine = host.lock()?;
         host.exit.ensure_new_operation()?;
-        let was_active = engine.store.snapshot().active_scene_id == scene_id;
+        let was_active = engine
+            .store
+            .active_scene()
+            .map_err(|error| error.to_string())?
+            .id
+            == scene_id;
         let snapshot = engine
             .store
             .apply(SceneCommand::CloseScene { scene_id })
@@ -815,8 +912,8 @@ async fn close_scene_window(app: AppHandle, scene_id: String) -> Result<HostSnap
         let has_frozen = snapshot.scenes.iter().any(|scene| {
             scene.frozen && scene.minimized && !scene.closed && frozen::has_content(scene)
         });
-        publish(&app, &snapshot);
-        (was_active, has_frozen)
+        let published = publish_owned(&app, snapshot);
+        (was_active, has_frozen, published)
     };
     if was_active {
         if has_frozen && !host.frozen_dismissed.load(Ordering::Acquire) {
@@ -829,15 +926,23 @@ async fn close_scene_window(app: AppHandle, scene_id: String) -> Result<HostSnap
         frozen::hide(&app)?;
     }
     // Closing is persisted even if a subsequent native window operation fails.
-    let engine = host.lock()?;
-    Ok(publish(&app, &engine.store.snapshot()))
+    Ok(published)
 }
 
 #[tauri::command]
-fn get_frozen_scenes(host: tauri::State<'_, Host>) -> Result<frozen::FrozenSnapshot, String> {
+async fn get_frozen_scenes(app: AppHandle) -> Result<frozen::FrozenSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<Host>();
+        get_frozen_scenes_blocking(&host)
+    })
+    .await
+    .map_err(|_| "会话列表读取中断".to_string())?
+}
+
+fn get_frozen_scenes_blocking(host: &Host) -> Result<frozen::FrozenSnapshot, String> {
     let engine = host.lock()?;
-    Ok(frozen::snapshot(
-        &engine.store.snapshot(),
+    Ok(frozen::snapshot_scenes(
+        engine.store.scenes(),
         host.revision.load(Ordering::Acquire),
     ))
 }
@@ -1089,25 +1194,22 @@ async fn restore_frozen_scene(app: AppHandle, scene_id: String) -> Result<HostSn
     pixel_sampler::invalidate(&app);
     pin_host::cancel_pending(&app, "space");
     recording::ensure_idle(&app)?;
-    let scene = host
-        .lock()?
-        .store
-        .snapshot()
-        .scenes
-        .into_iter()
-        .find(|scene| scene.id == scene_id)
-        .ok_or("会话不存在")?;
-    if !scene.frozen {
-        return Err("该会话已在空间中打开".into());
-    }
-    frozen::prepare_restore(&app, scene.background.as_ref()).await?;
+    let background = {
+        let engine = host.lock()?;
+        let scene = engine.store.scene(&scene_id).map_err(|_| "会话不存在")?;
+        if !scene.frozen {
+            return Err("该会话已在空间中打开".into());
+        }
+        scene.background.clone()
+    };
+    frozen::prepare_restore(&app, background.as_ref()).await?;
     let mut engine = host.lock()?;
     host.exit.ensure_new_operation()?;
     let snapshot = engine
         .store
         .apply(SceneCommand::ActivateScene { scene_id })
         .map_err(|error| error.to_string())?;
-    let snapshot = publish(&app, &snapshot);
+    let snapshot = publish_owned(&app, snapshot);
     show(&app);
     Ok(snapshot)
 }
@@ -1124,6 +1226,7 @@ struct RuntimeInfo {
     hotkey: String,
     capture_backend: &'static str,
     content_origin: String,
+    measure_interactions: bool,
 }
 #[tauri::command]
 fn runtime_info(app: AppHandle, host: tauri::State<'_, Host>) -> Result<RuntimeInfo, String> {
@@ -1132,6 +1235,7 @@ fn runtime_info(app: AppHandle, host: tauri::State<'_, Host>) -> Result<RuntimeI
         hotkey: capture_shortcut_host::active_display(&app),
         capture_backend: capture::backend_name(),
         content_origin: host.content_origin.clone(),
+        measure_interactions: interaction_performance::enabled(),
     })
 }
 
@@ -1399,7 +1503,7 @@ async fn expand_capture_space(
 /// Only the first-party Space can acknowledge its current, newly captured image.
 /// This command cannot initiate capture, switch scenes, or show a window.
 #[tauri::command]
-fn capture_background_ready(
+async fn capture_background_ready(
     app: AppHandle,
     window: tauri::WebviewWindow,
     scene_id: String,
@@ -1407,7 +1511,29 @@ fn capture_background_ready(
     width: u32,
     height: u32,
     success: bool,
+    diagnostics: Option<serde_json::Value>,
 ) -> Result<bool, String> {
+    let timing = interaction_performance::Trace::start(interaction_performance::Kind::CaptureAck);
+    tauri::async_runtime::spawn_blocking(move || {
+        capture_background_ready_blocking(app, window, scene_id, background_id, width, height, success, diagnostics, timing)
+    })
+    .await
+    .map_err(|_| "截图呈现确认中断".to_string())?
+}
+
+fn capture_background_ready_blocking(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    scene_id: String,
+    background_id: String,
+    width: u32,
+    height: u32,
+    success: bool,
+    diagnostics: Option<serde_json::Value>,
+    mut timing: interaction_performance::Trace,
+) -> Result<bool, String> {
+    timing.mark(interaction_performance::Stage::AckWorkerStarted);
+    let result = (|| -> Result<bool, String> {
     if window.label() != "space" {
         return Err("此窗口不能确认截图呈现".into());
     }
@@ -1418,7 +1544,9 @@ fn capture_background_ready(
         if window.is_visible().map_err(|_| "无法检查截图窗口")? {
             return Ok(false);
         }
+        timing.mark(interaction_performance::Stage::AckVisibilityChecked);
         let engine = host.lock()?;
+        timing.mark(interaction_performance::Stage::AckLocked);
         let asset = engine
             .store
             .active_background_for_preview(&scene_id, &background_id)
@@ -1426,6 +1554,7 @@ fn capture_background_ready(
         if asset.width != Some(width) || asset.height != Some(height) {
             return Ok(false);
         }
+        timing.mark(interaction_performance::Stage::AckIdentityChecked);
         host.capture_presentation.acknowledge(
             &capture_presentation::Identity {
                 scene: scene_id,
@@ -1441,10 +1570,19 @@ fn capture_background_ready(
         let _ = (scene_id, background_id, width, height, success);
         Ok(false)
     }
+
+    })();
+    if matches!(result, Ok(true)) {
+        timing.mark(interaction_performance::Stage::AckAccepted);
+        if success { interaction_performance::record_frontend(diagnostics); }
+        timing.finish(success);
+    } else { timing.finish(false); }
+    result
 }
 
 #[tauri::command]
 async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
+    let mut timing = interaction_performance::Trace::start(interaction_performance::Kind::Capture);
     recording::ensure_idle(&app)?;
     let host = app.state::<Host>();
     host.exit.ensure_new_operation()?;
@@ -1452,7 +1590,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
         // Match the original BeginCaptureAsync: ignore another request while
         // capture or a window transition owns the surface. This is not an error
         // or a progress notification, and must not release the current owner.
-        return get_snapshot(app.clone(), host);
+        return get_snapshot_blocking(app.clone(), &host);
     };
     #[cfg(target_os = "linux")]
     let transition = Arc::new(transition);
@@ -1464,7 +1602,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
         .snapshot_for_capture()
         .map_err(|e| e.to_string())?;
     let Some(work) = host.capture_jobs.begin()? else {
-        return get_snapshot(app.clone(), host);
+        return get_snapshot_blocking(app.clone(), &host);
     };
     let _invoke = work.cancel_on_drop();
     #[cfg(target_os = "linux")]
@@ -1491,7 +1629,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
     let window = app.get_webview_window("space").ok_or("窗口不存在")?;
     #[cfg(target_os = "linux")]
     if capture_wayland_host::is_wayland(&window, work.clone(), transition.clone()).await? {
-        return capture_wayland_host::capture(app.clone(), window, work, transition, preferences).await;
+        return capture_wayland_host::capture(app.clone(), window, work, transition, preferences, timing).await;
     }
     #[cfg(target_os = "linux")]
     let capture_witnesses = linux_capture_witnesses(&window, &work).await?;
@@ -1517,12 +1655,14 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
         witnesses
     };
     pin_window::capture_begin(&app);
+    timing.mark(interaction_performance::Stage::Admitted);
     {
         let engine = host.lock()?;
         engine.ocr_jobs.cancel_owner("space");
+        let scene_id = &engine.store.active_scene().map_err(|error| error.to_string())?.id;
         engine
             .translation_jobs
-            .cancel_scene("space", &engine.store.snapshot().active_scene_id);
+            .cancel_scene("space", scene_id);
     }
     if let Err(error) = hide_for_capture(
         &window,
@@ -1535,6 +1675,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
         if capture_check().is_ok() { show(&app); }
         return Err(error);
     }
+    timing.mark(interaction_performance::Stage::Hidden);
     if let Err(error) = work
         .wait_delay(preferences.capture_delay_seconds.seconds(), || {
             host.exit.ensure_new_operation()?;
@@ -1616,6 +1757,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
     })
     .await
     .map_err(|_| "截图任务中断".to_string())?;
+    timing.mark(interaction_performance::Stage::Captured);
     #[cfg(windows)]
     let mut presentation_required = false;
     let result = async {
@@ -1634,6 +1776,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
             #[cfg(target_os = "linux")]
             capture_check.clone(),
         ).await?;
+        timing.mark(interaction_performance::Stage::Expanded);
         #[cfg(target_os = "linux")]
         {
             let native_check = pending.native_check.clone().ok_or("截图缺少窗口状态见证")?;
@@ -1673,27 +1816,11 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
             for witness in &adoption_witnesses {
                 window_witness_linux::current(witness)?;
             }
-            let current = engine.store.snapshot();
-            let active = current
-                .scenes
-                .iter()
-                .find(|s| s.id == current.active_scene_id)
-                .ok_or("场景不存在")?;
-            if active.background.is_some()
-                || !active.messages.is_empty()
-                || !active.items.is_empty()
-                || !active.draft.is_empty()
-            {
-                engine
-                    .store
-                    .apply(SceneCommand::NewScene)
-                    .map_err(|e| e.to_string())?;
-            }
-            let id = engine.store.snapshot().active_scene_id;
             let snapshot = engine
                 .store
-                .set_background(&id, asset.clone())
+                .adopt_capture_background(asset.clone())
                 .map_err(|e| e.to_string())?;
+            let id = snapshot.active_scene_id.clone();
             #[cfg(target_os = "linux")]
             pending.retain();
             if let Some(map) = window_map {
@@ -1703,6 +1830,7 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
             }
             (id, snapshot)
         };
+        timing.mark(interaction_performance::Stage::Adopted);
         #[cfg(windows)]
         {
             presentation_required = true;
@@ -1714,7 +1842,8 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
             width: captured.width,
             height: captured.height,
         })?;
-        let published = publish(&app, &snapshot);
+        let published = publish_owned(&app, snapshot);
+        timing.mark(interaction_performance::Stage::Published);
         #[cfg(windows)]
         presentation
             .wait(|| {
@@ -1728,6 +1857,8 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
                 Ok(())
             })
             .await?;
+        #[cfg(windows)]
+        timing.mark(interaction_performance::Stage::Decoded);
         Ok(published)
     }
     .await;
@@ -1738,21 +1869,30 @@ async fn capture_screen(app: AppHandle) -> Result<HostSnapshot, String> {
         let restore = true;
         #[cfg(windows)]
         let restore = !presentation_required || result.is_ok();
-        if restore { show(&app); }
+        if restore {
+            show(&app);
+            timing.mark(interaction_performance::Stage::Shown);
+        }
     }
+    timing.finish(result.is_ok());
     result
 }
 
 #[tauri::command]
-fn read_artifact(host: tauri::State<'_, Host>, asset_id: String) -> Result<String, String> {
-    let asset = host.lock()?.store.asset(&asset_id).cloned().ok_or("素材不存在")?;
-    if !matches!(
-        asset.kind,
-        AssetKind::Html | AssetKind::Svg | AssetKind::Text
-    ) {
-        return Err("此素材不是文档".into());
-    }
-    assets::read_text(&asset, &host.assets)
+async fn read_artifact(app: AppHandle, asset_id: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<Host>();
+        let asset = host.lock()?.store.asset(&asset_id).cloned().ok_or("素材不存在")?;
+        if !matches!(
+            asset.kind,
+            AssetKind::Html | AssetKind::Svg | AssetKind::Text
+        ) {
+            return Err("此素材不是文档".into());
+        }
+        assets::read_text(&asset, &host.assets)
+    })
+    .await
+    .map_err(|_| "文档读取中断".to_string())?
 }
 #[tauri::command]
 async fn export_snapshot(app: AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
@@ -1778,10 +1918,11 @@ async fn export_region(
     scene_id: String,
     region_id: String,
     clipboard: bool,
+    variant: Option<image_host::ImageExportVariant>,
 ) -> Result<bool, String> {
-    #[cfg(any(windows, target_os = "macos"))]
-    return image_host::export_region(app, window, scene_id, region_id, clipboard).await;
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    return image_host::export_region(app, window, scene_id, region_id, clipboard, variant).await;
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let host = app.state::<Host>();
         let root = host.assets.clone();
@@ -2566,32 +2707,37 @@ mod run_authorization_tests {
 }
 
 #[tauri::command]
-fn cancel_run(
+async fn cancel_run(
     app: AppHandle,
-    host: tauri::State<'_, Host>,
     scene_id: String,
+    expected_run_id: String,
+) -> Result<HostSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<Host>();
+        cancel_run_blocking(app.clone(), &host, scene_id, expected_run_id)
+    })
+    .await
+    .map_err(|_| "取消对话中断".to_string())?
+}
+
+fn cancel_run_blocking(
+    app: AppHandle,
+    host: &Host,
+    scene_id: String,
+    expected_run_id: String,
 ) -> Result<HostSnapshot, String> {
     let mut engine = host.lock()?;
-    video_host::cancel_scene(&app, &scene_id);
-    let run_id = engine
-        .store
-        .snapshot()
-        .scenes
-        .iter()
-        .find(|s| s.id == scene_id)
-        .and_then(|s| s.run.as_ref())
-        .map(|r| r.id.clone());
-    let snapshot = engine
-        .store
-        .cancel_run(&scene_id)
-        .map_err(|e| e.to_string())?;
-    if let Some(id) = run_id {
-        engine.plugin_runs.remove(&id);
-        engine.agent_runs.remove(&id);
-        engine.visual_runs.remove(&id);
-        if let Some(sender) = engine.runs.remove(&id) {
-            let _ = sender.send(());
-        }
+    let snapshot = run_cancellation::cancel_current(
+        &mut engine.store,
+        &scene_id,
+        &expected_run_id,
+        || video_host::cancel_scene(&app, &scene_id),
+    ).map_err(|error| error.to_string())?;
+    engine.plugin_runs.remove(&expected_run_id);
+    engine.agent_runs.remove(&expected_run_id);
+    engine.visual_runs.remove(&expected_run_id);
+    if let Some(sender) = engine.runs.remove(&expected_run_id) {
+        let _ = sender.send(());
     }
     Ok(publish(&app, &snapshot))
 }
@@ -2617,6 +2763,20 @@ fn start_capture(app: &AppHandle) {
 
 static EARLY_QUIT: AtomicBool = AtomicBool::new(false);
 
+/// The keyboard hook only posts a request; existing capture admission and the
+/// UI thread own presentation. A closed/replaced shortcut cancels queued work.
+#[cfg(windows)]
+pub(crate) fn capture_system_shortcut_pressed(app: &AppHandle, epoch: u64) {
+    let target = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if system_capture_shortcut::dispatch_allowed(epoch)
+            && capture_shortcut_host::system_capture_allowed(&target)
+        {
+            start_capture(&target);
+        }
+    });
+}
+
 // macOS development builds embed one Info.plist symbol per macro expansion.
 // Share the expansion while constructing a fresh context for each CLI path.
 #[cfg(target_os = "macos")]
@@ -2640,6 +2800,8 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("--extension-worker") {
         std::process::exit(if mewu_extension::run_stdio_worker().is_ok() { 0 } else { 1 });
     }
+    let measurement_enabled = std::env::args().nth(1).as_deref() == Some("--measure-interactions");
+    interaction_performance::initialize(measurement_enabled);
     // Production admits only the fixed native recording worker. Other sealed
     // worker domains and the Code parent retain their explicit test admission.
     #[cfg(target_os = "linux")]
@@ -2847,8 +3009,10 @@ fn main() {
                 memory_host::queue_external_memory,
                 memory_host::forget_external_memory,
                 apply_scene_command,
+                add_capture_region,
                 capture_screen,
                 capture_background_ready,
+                drawing_diagnostics::record_drawing_diagnostics,
                 blackboard::create_blackboard,
                 blackboard::finish_blackboard,
                 blackboard::open_blackboard,
@@ -3129,6 +3293,9 @@ fn main() {
             recording_storage::prepare_video(&root)?;
             clipboard_video_storage::prepare(&root)?;
             let mut store = Store::open(root.join("spaces.db"))?;
+            if measurement_enabled {
+                store.set_persistence_observer(Some(interaction_performance::record_persistence));
+            }
             #[cfg(windows)]
             let legacy_import_warning = match legacy_connections::import_into(
                 &mut store,
@@ -3225,11 +3392,34 @@ fn main() {
             app.manage(pixel_sampler::PixelSampler::default());
             app.manage(pin_host::PinRegistry::default());
             capture_shortcut_host::initialize(app.handle(), &app.state::<Host>().root)?;
+            #[cfg(windows)]
+            {
+                let target = app.handle().clone();
+                let enabled = app.state::<Host>().system_preferences.view()
+                    .map(|value| value.replace_system_capture_shortcut)
+                    .unwrap_or(false);
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(error) = system_capture_shortcut::initialize(&target, enabled) {
+                        let _ = target.emit_to("space", "host-error", &error);
+                        let _ = target.emit_to("settings", "host-error", &error);
+                    }
+                });
+            }
             recording_audio_host::initialize(app.handle(), &app.state::<Host>().root)?;
             use tauri::{
                 menu::{Menu, MenuItem},
                 tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
             };
+            // AppIndicator does not report tray left-click events on Linux.
+            // Keep a native menu entry into the same capture admission path.
+            #[cfg(target_os = "linux")]
+            let capture = MenuItem::with_id(
+                app,
+                "capture",
+                ui_language::text("截图", "Capture"),
+                true,
+                None::<&str>,
+            )?;
             let settings = MenuItem::with_id(
                 app,
                 "settings",
@@ -3244,11 +3434,18 @@ fn main() {
                 true,
                 None::<&str>,
             )?;
+            #[cfg(target_os = "linux")]
+            let menu = Menu::with_items(app, &[&capture, &settings, &quit])?;
+            #[cfg(not(target_os = "linux"))]
+            let menu = Menu::with_items(app, &[&settings, &quit])?;
             app.manage(ui_language::TrayLabels {
+                #[cfg(target_os = "linux")]
+                capture: capture.clone(),
+                #[cfg(target_os = "linux")]
+                recording_controls: recording_tray_linux::Controls::new(menu.clone()),
                 settings: settings.clone(),
                 quit: quit.clone(),
             });
-            let menu = Menu::with_items(app, &[&settings, &quit])?;
             let mut tray = TrayIconBuilder::new()
                 .menu(&menu)
                 .tooltip("Mewu 1.0")
@@ -3264,6 +3461,10 @@ fn main() {
                     }
                 })
                 .on_menu_event(|app, event| match event.id.as_ref() {
+                    #[cfg(target_os = "linux")]
+                    "capture" => start_capture(app),
+                    #[cfg(target_os = "linux")]
+                    id if recording_tray_linux::handle(app, id) => {},
                     "settings" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {

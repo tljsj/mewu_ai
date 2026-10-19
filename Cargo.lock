@@ -3229,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "mewu-desktop"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "arboard",
  "async-io",
@@ -3300,6 +3300,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "tauri-runtime",
  "tiny_http",
  "tokio",
  "unicode-segmentation",
@@ -3307,10 +3308,12 @@ dependencies = [
  "url",
  "uuid",
  "webkit2gtk",
+ "webview2-com",
  "windows",
  "windows-capture",
  "windows-future",
  "windows-sys 0.61.2",
+ "wry",
  "x11rb",
  "xcap",
  "zbus",

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 import type { VideoAnnotationDocument } from './video-annotation-contracts';
 export type AssetKind = 'image' | 'video' | 'html' | 'svg' | 'text' | 'file';
+export type ImageExportVariant = 'annotated' | 'original';
 export interface CaptureCoordinates { space: 'quartzPoints' | 'physicalPixels'; originX: number; originY: number; width: number; height: number }
 export interface Asset { id: string; name: string; kind: AssetKind; path: string; width?: number; height?: number; originX?: number; originY?: number; scaleFactor?: number; captureCoordinates?: CaptureCoordinates }
 export type ManualDrawingKind = 'pen' | 'line' | 'arrow' | 'rect' | 'ellipse' | 'text' | 'highlighter' | 'mark' | 'number' | 'mosaic';
@@ -9,7 +10,8 @@ export interface RichDrawingRef { layoutId: string; layoutSha256: string; raster
 export interface DrawingPoint { x: number; y: number }
 export interface DrawingOrigin { runId: string; userMessageId: string; toolEventId: string; groupId: string; targetHandle: string; manifestSha256: string }
 export interface VisualAnnotationGrant { pluginId: string; pluginRevision: number; contributionId: string }
-export interface Drawing { id: string; kind: DrawingKind; color: string; strokeWidth: number; points: DrawingPoint[]; text?: string; fontSize?: number; origin?: DrawingOrigin; rich?: RichDrawingRef }
+export interface DrawingTextStyle { bold?: boolean; italic?: boolean; underline?: boolean; strikethrough?: boolean }
+export interface Drawing { id: string; kind: DrawingKind; color: string; strokeWidth: number; points: DrawingPoint[]; text?: string; fontSize?: number; textStyle?: DrawingTextStyle; origin?: DrawingOrigin; rich?: RichDrawingRef }
 export interface DrawingStrokeErase { drawingId:string;fragments:{id:string;points:DrawingPoint[]}[] }
 export interface DrawingEdit { index: number; before: Drawing | null; after: Drawing | null }
 export type DrawingStep = DrawingEdit | { batch: DrawingEdit[] };
@@ -31,6 +33,7 @@ export type DrawingCommand = DrawingTarget & (
   | {type:'update_drawings';drawings:Drawing[]}
   | {type:'erase_drawing_strokes';erasures:DrawingStrokeErase[]}
   | { type: 'remove_drawing'; drawingId: string }
+  | { type: 'remove_drawings'; drawingIds: string[] }
   | { type: 'undo_drawing' | 'redo_drawing' }
 );
 // Region coordinates are pixels relative to the background; item bounds are viewport fractions.
@@ -113,5 +116,6 @@ export type ImageAnnotationEdit =
   | { type: 'update_drawings'; drawings: Drawing[] }
   | { type: 'erase_drawing_strokes'; erasures: DrawingStrokeErase[] }
   | { type: 'remove_drawing'; drawingId: string }
+  | { type: 'remove_drawings'; drawingIds: string[] }
   | { type: 'undo_drawing' | 'redo_drawing' };
 export interface RunEvent { sceneId: string; runId: string; text?: string; reasoning?: string; status: 'running' | 'completed' | 'failed' | 'canceled'; error?: string }

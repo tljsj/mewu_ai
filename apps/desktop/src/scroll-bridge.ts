@@ -10,6 +10,9 @@ export interface ScrollStatus {
   status: 'initial' | 'extended' | 'retraced' | 'unchanged' | 'low_information' | 'ambiguous' | 'lost_overlap' | 'limit_reached';
   stopHotkey: string;
   preview?:string;
+  // Normalized to the source monitor. The native HUD dims the surrounding
+  // monitor while retaining a real hole for every acquired pixel.
+  hud?: { outline: ScrollStatus['rect']; preview: ScrollStatus['rect'] | null; controls: ScrollStatus['rect'] | null };
   automatic?: boolean;
 }
 export type ScrollAction = 'finish' | 'keep' | 'cancel';

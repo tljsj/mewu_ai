@@ -768,6 +768,7 @@
   "录屏声音 · {0}": "Recording audio · {0}",
   "录屏声音：{0}": "Recording audio: {0}",
   "录屏控制": "Recording controls",
+  "框选录制范围": "Select the recording area",
   "录屏错误": "Recording error",
   "待处理记录已满": "The pending record queue is full",
   "待执行": "Ready to run",
@@ -1114,5 +1115,14 @@
   "此功能不支持当前系统": "This feature is not supported on this system",
   "此插件的本机能力不支持当前系统": "This plugin's native capability is not supported on this system",
   "区域操作仅支持 Windows": "Region operation is available on Windows only",
-  "插件平台声明无效": "Invalid plugin platform declaration"
+  "插件平台声明无效": "Invalid plugin platform declaration",
+  "使用 Win+Shift+S 截图": "Use Win+Shift+S for screenshots",
+  "无法接管系统截图快捷键": "Cannot take over the system screenshot shortcut",
+  "颜色 {0}：{1}": "Color {0}: {1}",
+  "加粗": "Bold",
+  "斜体": "Italic",
+  "下划线": "Underline",
+  "删除线": "Strikethrough",
+  "带标注图": "Annotated image",
+  "原图": "Original image"
 }

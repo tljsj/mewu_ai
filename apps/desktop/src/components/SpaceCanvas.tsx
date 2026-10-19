@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MPL-2.0
 import { t } from "../i18n";
 import { nativeSelectOwnsEscape } from '../native-select-escape';
-import { createEffect, createMemo, createSignal, For, on, onCleanup, Show, untrack } from 'solid-js';
-import { Check, ChevronDown, Circle, Copy, Download, Languages, LoaderCircle, Pencil, Pin, Plus, Table2, TextSelect, Trash2, X } from 'lucide-solid';
+import { batch, createEffect, createMemo, createSignal, For, on, onCleanup, Show, untrack } from 'solid-js';
+import { Check, ChevronDown, Circle, Copy, Languages, LoaderCircle, Pencil, Pin, Plus, Table2, TextSelect, Trash2, X } from 'lucide-solid';
 import ScrollCaptureIcon from './ScrollCaptureIcon';
 import ApplicationSnapshotIcon from './ApplicationSnapshotIcon';
 import ExtensionSelectionTools from './ExtensionSelectionTools';
 import { recordingGrant, recordingTrimGrant } from '../recording-audio';
-import type { DrawingCommand, OcrTarget, Reference, Region, RegionGeometry, Scene, SceneCommand, Snapshot, SpaceItem } from '../contracts';
+import type { DrawingCommand, ImageExportVariant, OcrTarget, Reference, Region, RegionGeometry, Scene, SceneCommand, Snapshot, SpaceItem } from '../contracts';
 import { geometryTarget, overlayRegion, sameGeometry, type RegionGeometryCoordinator, type GeometryView } from '../region-geometry';
 import { geometryHistoryKey, type GeometryDirection } from '../region-geometry-history';
 import type { PluginContribution, PluginRecord } from '../plugin-contracts';
 import { assetUrl, captureBackgroundReady, exportRegion as exportNativeRegion, exportImageItem, exportTextAsset, native } from '../bridge';
+import { capturePreparationPerformance } from '../capture-performance';
 import { prepareCaptureBackground } from '../capture-presentation';
 import { captureDisplayGeometry } from '../capture-display';
 import { persistBackgroundItem, projectBackgroundItem } from '../media-item-geometry';
@@ -24,6 +25,7 @@ import { isCoreReplacementPlugin } from '../plugin-core';
 import DrawingLayer from './DrawingLayer';
 import DrawingEditor from './DrawingEditor';
 import ImageDrawingEditor from './ImageDrawingEditor';
+import ImageExportButton from './ImageExportButton';
 import { imageObjectBox } from '../image-annotations';
 import { usesDrawingDocument, type DrawingSession } from '../drawing-document';
 import type { DrawingLayoutTarget, DrawingTableFormat } from '../drawing-layout-preview';
@@ -46,7 +48,8 @@ import { playPingAudio, playPingSound, preloadPingAudio } from '../ping-sound';
 import { PING_DEFAULT_SKIN_BY_ACTION, PING_HUB_ICON, PING_MARKER_ART, PING_SKINS, PING_VOICES, PING_WHEEL_ICONS, PING_SOUNDS_LIB } from '../ping-assets';
 import { regionImageProjection } from '../region-image';
 import { getWindowSnapMap } from '../window-snap-bridge';
-import { SnapMapLoader, SnapSelectionGesture, SnapshotSelections, snapImagePoint, snapResize, snapTarget, type FrameSnapMap } from '../window-snap';
+import { DrawingInputPhase, drawingDiagnosticsEnabled, recordDrawingInput } from '../drawing-diagnostics';
+import { SnapMapLoader, SnapSelectionGesture, SnapshotSelections, snapImagePoint, snapResize, snapTarget, type FrameSnapMap, type SnapNode } from '../window-snap';
 import './capture.css';
 import type { RegisterDrawingHistory } from '../drawing-editor-port';
 
@@ -82,6 +85,7 @@ interface Props {
   onSelectionActivity?: (active: boolean) => void;
   onExportActivity?: (active: boolean) => void;
   onSelectionComplete?: (region: Region) => void;
+  recordingSelection?: boolean;
   onActiveRegionChange?: (sceneId: string, regionId: string | undefined) => void;
   onFocusComposer?: () => void;
   onBeforeExport?: () => Promise<void>;
@@ -112,6 +116,7 @@ interface Props {
   pingWheelMode?: 'click' | 'lol';
 }
 interface Box { x: number; y: number; width: number; height: number }
+interface PendingSelection { sceneId: string; backgroundId: string; region: Region; version: number; automatic?: SnapNode; complete: boolean; acknowledged?: boolean; presented?: boolean }
 interface PluginEntry { plugin: PluginRecord; contribution: PluginContribution }
 type Handle = 'nw' | 'n' | 'ne' | 'w' | 'e' | 'sw' | 's' | 'se';
 const CORNERS: Handle[] = ['nw', 'ne', 'sw', 'se'];
@@ -150,6 +155,9 @@ export default function SpaceCanvas(props: Props) {
   function backgroundLoaded(image: HTMLImageElement, backgroundId: string) {
     setNatural({ width: image.naturalWidth, height: image.naturalHeight });
     setBackgroundError(false);
+    backgroundReady(image, backgroundId);
+  }
+  function backgroundReady(image: HTMLImageElement, backgroundId: string) {
     if (!native) return;
     const sceneId = props.scene.id, background = props.scene.background;
     if (background?.id !== backgroundId || !background.width || !background.height) return;
@@ -158,18 +166,20 @@ export default function SpaceCanvas(props: Props) {
       sceneId, backgroundId, width: background.width, height: background.height,
     }, () => !disposed && !props.scene.closed && !props.scene.frozen
       && props.scene.id === sceneId && props.scene.background?.id === backgroundId
-      && image.getAttribute('src') === source, captureBackgroundReady).catch(() => {
+      && image.getAttribute('src') === source, captureBackgroundReady,
+      () => capturePreparationPerformance({ sceneId, backgroundId, width: background.width!, height: background.height! })).catch(() => {
       // The capture owner reports a failed/canceled IPC. A stale callback cannot
       // wake it, show a window, or add another notification to a later scene.
     });
   }
-  function backgroundFailed(backgroundId: string) {
+  function backgroundAttached(image: HTMLImageElement, backgroundId: string) {
+    // Solid sets the remaining attributes and connects this actual element in
+    // the current turn. Start decode then, without waiting for the load event.
+    queueMicrotask(() => backgroundReady(image, backgroundId));
+  }
+  function backgroundFailed(image: HTMLImageElement, backgroundId: string) {
     setBackgroundError(true); props.onError('无法读取屏幕截图');
-    const background = props.scene.background;
-    if (native && background?.id === backgroundId && background.width && background.height) {
-      void captureBackgroundReady({ sceneId: props.scene.id, backgroundId,
-        width: background.width, height: background.height, success: false }).catch(() => {});
-    }
+    backgroundReady(image, backgroundId);
   }
   const videoGrant = createMemo(() => {
     if (props.scene.run?.status === 'running') return;
@@ -183,9 +193,11 @@ export default function SpaceCanvas(props: Props) {
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
   let cancelGesture: (() => void) | undefined;
+  let newSelectionSource: (() => boolean) | undefined;
   let lastSceneId: string | undefined;
   let pointerInspector: PointerInspectorHandle | undefined;
   let interactionVersion = 0;
+  let pendingSelectionEpoch = 0;
   let disposed = false;
   let cancelDeferredPointer: (() => void) | undefined;
   let forceManualSelection: (() => void) | undefined;
@@ -196,6 +208,9 @@ export default function SpaceCanvas(props: Props) {
   const [viewport, setViewport] = createSignal({ width: innerWidth, height: innerHeight, deviceScale: devicePixelRatio });
   const [natural, setNatural] = createSignal({ width: 0, height: 0 });
   const [selection, setSelection] = createSignal<Box>();
+  const [pendingSelection, setPendingSelection] = createSignal<PendingSelection>();
+  // Presentation-only backlog; saved regions and tool authority remain native-owned.
+  const [pendingSelectionOutlines, setPendingSelectionOutlines] = createSignal<PendingSelection[]>([]);
   const [snapMap, setSnapMap] = createSignal<FrameSnapMap>();
   const snapshotSelections = new SnapshotSelections();
   const [snapshotVersion, setSnapshotVersion] = createSignal(0);
@@ -207,6 +222,8 @@ export default function SpaceCanvas(props: Props) {
   const [activity, setActivity] = createSignal(false);
   const [forceNew, setForceNew] = createSignal(false);
   const [toolbarVisible, setToolbarVisible] = createSignal(false);
+  const [imageExportOpen, setImageExportOpen] = createSignal(false);
+  let openRegionImageExport: (() => void) | undefined;
   const [toolbarBox, setToolbarBox] = createSignal<Box>({ x: 0, y: 0, width: TOOLBAR_WIDTH, height: TOOLBAR_HEIGHT });
   const [backgroundError, setBackgroundError] = createSignal(false);
   const [flashedRegion, setFlashedRegion] = createSignal('');
@@ -214,7 +231,7 @@ export default function SpaceCanvas(props: Props) {
   const [imageDrawing, setImageDrawing] = createSignal<{sceneId:string;itemId:string;assetId:string}>();
   const imageDrawingItem = createMemo(() => { const target=imageDrawing(); return target?.sceneId===props.scene.id ? props.scene.items.find(item=>item.id===target.itemId&&item.asset.id===target.assetId&&item.asset.kind==='image') : undefined; });
   const closeImageDrawing = () => { setImageDrawing(undefined); setSelectionActivity(false); props.onFocusComposer?.(); };
-  const beginImageDrawing = (id:string) => { const item=props.scene.items.find(item=>item.id===id); if(!item||blocked()||drawingSession()||props.scene.run?.status==='running'||!props.onImageDrawingCommand)return; hideToolbar();setActiveItemId(id);setImageDrawing({sceneId:props.scene.id,itemId:id,assetId:item.asset.id});setSelectionActivity(true); };
+  const beginImageDrawing = (id:string) => { const item=props.scene.items.find(item=>item.id===id); if(!item||blocked()||drawingSession()||props.scene.run?.status==='running'||!props.onImageDrawingCommand)return; activateItem(id);setImageDrawing({sceneId:props.scene.id,itemId:id,assetId:item.asset.id});setSelectionActivity(true); };
   const [pluginMenu, setPluginMenu] = createSignal<'workflow' | 'ocr' | 'scroll' | 'translation' | 'pin'>();
   const [pingWheel, setPingWheel] = createSignal<{ x: number; y: number } | null>(null);
   const [pingSlot, setPingSlot] = createSignal(-1);
@@ -236,7 +253,8 @@ export default function SpaceCanvas(props: Props) {
   const [exporting, setExporting] = createSignal(false);
   const [codeFocused, setCodeFocused] = createSignal(document.hasFocus() && !document.hidden);
   const [codeModal, setCodeModal] = createSignal(false);
-  const snapLoader = new SnapMapLoader(getWindowSnapMap, value => { if (!disposed) { setSnapMap(value); if (snapPointer) updateSnapPreview(snapPointer); } });
+  const snapLoader = new SnapMapLoader(getWindowSnapMap, value => { if (!disposed) { setSnapMap(value); if (snapPointer) updateSnapPreview(snapPointer); } },
+    () => drawingDiagnosticsEnabled() ? (code, count) => recordDrawingInput(DrawingInputPhase.windowSnapMap, undefined, undefined, code, count) : undefined);
   const ocrRequests = new OcrRequestGate<Snapshot>({
     run: request => props.onOcrRequest(request), cancel: id => props.onOcrCancel(id), pending: setOcrPending,
     result: (snapshot, request) => {
@@ -259,11 +277,15 @@ export default function SpaceCanvas(props: Props) {
     const height = props.scene.background?.height || natural().height;
     return captureDisplayGeometry(props.scene.background, width, height, viewport(), viewport().deviceScale);
   });
+  // One index per saved snapshot. Pointer/geometry previews must not run a
+  // linear search for every property of every region on each move.
+  const savedRegions = createMemo(() => new Map(props.scene.regions.map(region => [region.id, region])));
+  const regionIds = createMemo(() => props.scene.regions.map(region => region.id));
   const regionById = (id: string) => {
-    const saved = props.scene.regions.find(region => region.id === id);
+    const saved = savedRegions().get(id);
     return saved && overlayRegion(props.scene, saved, props.geometryView.overlay);
   };
-  const cropChanged = (region: Region) => !region.imageOverride && props.geometryView.overlay?.regionId === region.id && !sameGeometry(region, props.scene.regions.find(value => value.id === region.id)!);
+  const cropChanged = (region: Region) => !region.imageOverride && props.geometryView.overlay?.regionId === region.id && !sameGeometry(region, savedRegions().get(region.id)!);
   const backgroundAnchored = (item: SpaceItem) => item.asset.kind === 'video' && item.state?.coordinateSpace === 'background' && item.state.backgroundId === props.scene.background?.id && geometry().width > 0 && geometry().height > 0;
   const displayedItem = (id: string) => {
     const item = props.scene.items.find(item => item.id === id)!;
@@ -299,8 +321,9 @@ export default function SpaceCanvas(props: Props) {
       onPin={props.onPinItem&&(item().asset.kind==='image'||item().asset.kind==='video')?()=>props.onPinItem!(id):undefined}
       busy={props.busy||(itemProps.board&&props.blackboardEnabled===false)}
       video={props.video?{...props.video,sceneId:props.scene.id,busy:props.busy,annotationBusy:props.scene.closed||props.scene.frozen||props.scene.run?.status==='running',authoringBusy:props.authoringBusy,inputLocked:props.inputLocked,drawingAllowed:!drawingSession(),drawingGrant:videoDrawingGrant(),grant:videoGrant()}:undefined}
-      item={item()} active={activeItemId()===id} onActivate={()=>setActiveItemId(id)} referenced={props.refs.some(ref=>ref.kind==='item'&&ref.id===id)} onReference={()=>props.onReference({kind:'item',id})} onRemove={()=>props.onRemoveItem(id)} onUpdate={updateItem}
+      item={item()} active={activeItemId()===id} onActivate={()=>activateItem(id)} referenced={props.refs.some(ref=>ref.kind==='item'&&ref.id===id)} onReference={()=>props.onReference({kind:'item',id})} onRemove={()=>props.onRemoveItem(id)} onUpdate={updateItem}
       onCopy={props.onVideoCopy?()=>{void props.onVideoCopy!(id).catch(error=>props.onError(error instanceof Error?error.message:String(error)));}:undefined}
+      onExportImage={variant=>{const current=props.scene.items.find(value=>value.id===id);if(current?.asset.kind==='image')void exportImage(current,false,false,variant);}}
       onExport={()=>{const item=props.scene.items.find(item=>item.id===id);const saving=item?.asset.kind==='text'?exportTextAsset(item.asset.id):item?.asset.kind==='video'?props.onVideoExport?.(id):undefined;void saving?.catch(error=>props.onError(error instanceof Error?error.message:String(error)));}}/>;}}</For>;
   const activeRegion = createMemo(() => regionById(active()));
   const activeRegionIdentity = createMemo(() => [props.scene.id, activeRegion()?.id] as const, undefined,
@@ -317,18 +340,29 @@ export default function SpaceCanvas(props: Props) {
   const translationVisible = (region: Region) => active() === region.id && selectedTextMode(region) === 'translation' && !drawingSession() && !forceNew() && Boolean(savedTranslation(region)?.selection.lines.length);
   const display = (region: Box): Box => ({ x: geometry().x + region.x * geometry().scale, y: geometry().y + region.y * geometry().scale, width: region.width * geometry().scale, height: region.height * geometry().scale });
   const imageProjection = (region: Region) => regionImageProjection(region, display(region), props.scene.background!, geometry().scale);
-  const regions = () => props.scene.regions.map(region => ({ region, box: display(regionById(region.id)!) }));
+  // Hit testing is paused during a pointer gesture; do not project all saved
+  // boxes just to maintain an unused hover cache on every captured move.
+  const regions = createMemo(() => activity() ? [] : props.scene.regions.map(region => ({ region, box: display(overlayRegion(props.scene, region, props.geometryView.overlay)) })));
+  // Presentation only: pending geometry never enters the saved region/tool lists.
+  const selectionPreview = createMemo(() => {
+    if (selection()) return selection();
+    const pending = pendingSelection();
+    if (!pending || !currentPendingSelection(pending) || pending.presented) return;
+    return display(pending.region);
+  });
+  const queuedSelectionPreviews = createMemo(() => pendingSelectionOutlines()
+    .filter(pending => pending.region.id !== pendingSelection()?.region.id && currentPendingSource(pending) && !pending.presented));
   const point = (event: PointerEvent) => ({ x: clamp(event.clientX, geometry().x, geometry().x + geometry().width), y: clamp(event.clientY, geometry().y, geometry().y + geometry().height) });
   const referenced = (id: string) => props.refs.some(ref => ref.kind === 'region' && ref.id === id);
   const blocked = () => props.busy || exporting() || settling() || extensionRunning() || props.scene.run?.status === 'running';
   const scanSource = createMemo(() => {
-    if (!props.onCodeSource || !codeFocused() || props.busy || drawingSession() || selection() || forceNew() || backgroundError() || props.geometryView.pending || props.geometryView.held) return;
+    if (!props.onCodeSource || !codeFocused() || props.busy || drawingSession() || selection() || pendingSelection() || forceNew() || backgroundError() || props.geometryView.pending || props.geometryView.held) return;
     return codeSource(props.scene, active(), props.plugins);
   }, undefined, { equals: (a, b) => a?.key === b?.key });
   const codesPaused = () => Boolean(activity() || exporting() || settling() || pluginMenu() || ocrPending() || props.translationPending || codeModal());
   const visibleCodes = createMemo(() => { const view = props.codeView; return view?.key === scanSource()?.key && view?.result.codes.length ? view : undefined; });
   createEffect(on(() => [scanSource(), codesPaused()] as const, ([source, paused]) => props.onCodeSource?.(source, paused)));
-  const snapUnavailable = () => blocked() || activity() || forceNew() || drawingSession() || pluginMenu() || ocrPending() || props.translationPending || props.geometryView.pending || props.geometryView.held || props.scene.frozen || props.scene.closed || backgroundError();
+  const snapUnavailable = () => blocked() || activity() || pendingSelection() || forceNew() || drawingSession() || pluginMenu() || ocrPending() || props.translationPending || props.geometryView.pending || props.geometryView.held || props.scene.frozen || props.scene.closed || backgroundError();
   function clearSnapPreview() { snapPointer = undefined; setSnapPreview(undefined); }
   function candidateAt(x: number, y: number) {
     const map = snapMap(), bg = props.scene.background, box = geometry();
@@ -336,10 +370,20 @@ export default function SpaceCanvas(props: Props) {
     const pixel = snapImagePoint(x, y, box, box.scale);
     return pixel && snapTarget(map, pixel.x, pixel.y);
   }
-  function previewCandidateAt(pointer: { x: number; y: number; shiftKey: boolean }) {
+  function previewCandidateAt(pointer: { x: number; y: number; shiftKey: boolean }, observe?: (reason: number) => void) {
+    if (snapUnavailable()) { observe?.(1); return; }
+    if (pointer.shiftKey) { observe?.(2); return; }
+    if (!document.hasFocus()) { observe?.(3); return; }
     const target = document.elementFromPoint(pointer.x, pointer.y), composer = composerBox();
-    if (snapUnavailable() || pointer.shiftKey || !document.hasFocus() || !target?.closest('.capture-surface') || target.closest('button,a,input,textarea,select,[contenteditable]:not([contenteditable="false"]),.artifact-card,.capture-region,.capture-toolbar,.selection-code-card,.ocr-text-layer,.drawing-editor') || document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]') || (toolbarVisible() && contains(toolbarBox(), pointer.x, pointer.y, TOLERANCE)) || (composer && contains(composer, pointer.x, pointer.y)) || regions().some(entry => contains(entry.box, pointer.x, pointer.y, 5))) return;
-    return candidateAt(pointer.x, pointer.y);
+    if (!target?.closest('.capture-surface')) { observe?.(4); return; }
+    if (target.closest('button,a,input,textarea,select,[contenteditable]:not([contenteditable="false"]),.artifact-card,.capture-region,.capture-toolbar,.selection-code-card,.ocr-text-layer,.drawing-editor')) { observe?.(5); return; }
+    if (document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]')) { observe?.(6); return; }
+    if (toolbarVisible() && contains(toolbarBox(), pointer.x, pointer.y, TOLERANCE)) { observe?.(7); return; }
+    if (composer && contains(composer, pointer.x, pointer.y)) { observe?.(8); return; }
+    if (regions().some(entry => contains(entry.box, pointer.x, pointer.y, 5))) { observe?.(9); return; }
+    const candidate = candidateAt(pointer.x, pointer.y);
+    observe?.(candidate ? 0 : 10);
+    return candidate;
   }
   function updateSnapPreview(pointer: { x: number; y: number; shiftKey: boolean }) {
     snapPointer = pointer;
@@ -373,12 +417,15 @@ export default function SpaceCanvas(props: Props) {
     }).catch(() => cancel());
     return true;
   }
+  function activateItem(id: string) {
+    batch(() => { clearPendingSelection(); hideToolbar(); setActive(''); setActiveItemId(id); });
+  }
   function clearHideTimer() { if (hideTimer !== undefined) clearTimeout(hideTimer); hideTimer = undefined; }
-  function hideToolbar() { clearHideTimer(); setToolbarVisible(false); setPluginMenu(undefined); }
+  function hideToolbar() { clearHideTimer(); if(imageExportOpen())return; setToolbarVisible(false); setPluginMenu(undefined); }
   function scheduleHide() {
-    if (!toolbarVisible() || extensionInteracting() || hideTimer !== undefined) return;
+    if (!toolbarVisible() || extensionInteracting() || imageExportOpen() || hideTimer !== undefined) return;
     // One timer per departure. Continuous movement outside must not reset it.
-    hideTimer = setTimeout(() => { hideTimer = undefined; if (!extensionInteracting()) setToolbarVisible(false); }, 300);
+    hideTimer = setTimeout(() => { hideTimer = undefined; if (!extensionInteracting() && !imageExportOpen()) setToolbarVisible(false); }, 300);
   }
   function composerBox(): Box | undefined {
     const element = document.querySelector<HTMLElement>('.composer');
@@ -407,7 +454,8 @@ export default function SpaceCanvas(props: Props) {
   }
   function revealToolbar(region: Region) {
     if (activity() || forceNew()) return;
-    clearHideTimer(); setActive(region.id); placeToolbar(region); setToolbarVisible(true);
+    if ((pendingSelection() || pendingSelectionOutlines().length) && pendingSelection()?.region.id !== region.id) clearPendingSelection();
+    batch(() => { clearHideTimer(); setActiveItemId(''); setActive(region.id); placeToolbar(region); setToolbarVisible(true); });
   }
   function hover(event: PointerEvent) {
     lastPointer = { x: event.clientX, y: event.clientY };
@@ -417,14 +465,20 @@ export default function SpaceCanvas(props: Props) {
     if (event.target instanceof Element && event.target.closest('.selection-code-card')) { clearSnapPreview(); clearHideTimer(); return; }
     updateSnapPreview({ x: event.clientX, y: event.clientY, shiftKey: event.shiftKey });
     if (activity() || forceNew() || exporting() || props.geometryView.held || props.geometryView.pending) return;
+    if (activeItemId()) { scheduleHide(); return; }
     const target = event.target instanceof Element ? event.target : undefined;
     if ((pluginMenu()) && target?.closest('.capture-toolbar')) { clearHideTimer(); return; }
     const composer = composerBox();
     if (!target?.closest('.capture-surface') || target.closest('.artifact-card') || (composer && contains(composer, event.clientX, event.clientY))) { scheduleHide(); return; }
     if (toolbarVisible() && contains(toolbarBox(), event.clientX, event.clientY, TOLERANCE)) { clearHideTimer(); return; }
     // Last drawn wins for overlapping regions, matching the capture surface.
-    const hovered = [...props.scene.regions].reverse().find(region => contains(display(regionById(region.id)!), event.clientX, event.clientY, 5));
-    if (hovered) revealToolbar(regionById(hovered.id)!); else scheduleHide();
+    const candidates = regions();
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      if (contains(candidates[index].box, event.clientX, event.clientY, 5)) {
+        revealToolbar(regionById(candidates[index].region.id)!); return;
+      }
+    }
+    scheduleHide();
   }
   function setSelectionActivity(value: boolean) {
     if (activity() === value) return;
@@ -560,21 +614,24 @@ export default function SpaceCanvas(props: Props) {
     if (pingMarkerTimer !== undefined) clearTimeout(pingMarkerTimer);
     pingMarkerTimer = window.setTimeout(() => { pingMarkerTimer = undefined; setPingMarker(null); }, 3300);
   }
-  function trackPointer(event: PointerEvent, move: (event: PointerEvent) => void, finish: (committed: boolean) => void) {
+  function trackPointer(event: PointerEvent, move: (event: PointerEvent) => void, finish: (committed: boolean) => void, sourceCurrent?: () => boolean, preservePendingOutlines = false) {
     ocrRequests.cancel(); props.onTranslationCancel?.(); cancelGesture?.(); event.preventDefault(); event.stopPropagation();
     interactionVersion++;
+    if (preservePendingOutlines) retirePendingSelection(); else clearPendingSelection();
     clearSnapPreview();
     window.getSelection()?.removeAllRanges(); hideToolbar(); setSelectionActivity(true);
     const pointerId = event.pointerId;
+    newSelectionSource = sourceCurrent;
     let ended = false;
     const cleanup = () => {
       canvas.removeEventListener('pointermove', moved); canvas.removeEventListener('pointerup', released);
       canvas.removeEventListener('pointercancel', canceled); canvas.removeEventListener('lostpointercapture', canceled);
       cancelGesture = undefined;
+      newSelectionSource = undefined;
       if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId);
     };
-    const end = (committed: boolean) => { if (ended) return; ended = true; cleanup(); setSelectionActivity(false); finish(committed); };
-    const moved = (next: PointerEvent) => { if (next.pointerId === pointerId) { next.preventDefault(); move(next); } };
+    const end = (committed: boolean) => { if (ended) return; ended = true; cleanup(); batch(() => { setSelectionActivity(false); finish(committed); }); };
+    const moved = (next: PointerEvent) => { if (next.pointerId === pointerId) { if (sourceCurrent && !sourceCurrent()) { end(false); return; } next.preventDefault(); move(next); } };
     const released = (next: PointerEvent) => { if (next.pointerId === pointerId) { moved(next); end(true); } };
     const canceled = (next: PointerEvent) => { if (next.pointerId === pointerId) end(false); };
     cancelGesture = () => end(false);
@@ -583,18 +640,25 @@ export default function SpaceCanvas(props: Props) {
     try { canvas.setPointerCapture(pointerId); } catch { end(false); }
   }
   function begin(event: PointerEvent) {
-    if (props.blackboard) return;
+    if (props.blackboard) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 5); return; }
     if (pingWheel() || pingArmed) return; // ping 手势期间不进入框选
-    if (event.button !== 0 || activity() || !props.scene.background || backgroundError() || !geometry().width || blocked()) return;
+    if (event.button !== 0) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 1); return; }
+    if (activity()) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 2); return; }
+    if (!props.scene.background || backgroundError() || !geometry().width) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 4); return; }
+    if (blocked()) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 3); return; }
     const target = event.target as Element;
-    if (target.closest('button,.artifact-card,.capture-toolbar,.selection-code-card')) return;
-    if (target.closest('.capture-region') && !event.shiftKey && !forceNew()) return;
-    if (deferGeometryPointer(event, () => begin(event))) return;
+    if (target.closest('button,.artifact-card,.capture-toolbar,.selection-code-card')) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 5); return; }
+    if (target.closest('.capture-region') && !event.shiftKey && !forceNew()) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 5); return; }
+    if (deferGeometryPointer(event, () => begin(event))) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event, undefined, 6); return; }
+    if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionBegin, event);
+    retirePendingSelection();
     setActiveItemId('');
     endNudge();
     const start = point(event), scale = geometry().scale, offset = { x: geometry().x, y: geometry().y };
+    const sourceGeometry = { ...geometry() }, sourceViewport = { ...viewport() };
     const sceneId = props.scene.id, backgroundId = props.scene.background.id;
-    const automatic = previewCandidateAt({ x: event.clientX, y: event.clientY, shiftKey: event.shiftKey });
+    const automatic = previewCandidateAt({ x: event.clientX, y: event.clientY, shiftKey: event.shiftKey },
+      drawingDiagnosticsEnabled() ? code => recordDrawingInput(DrawingInputPhase.windowSnapDown, event, undefined, code) : undefined);
     const gesture = new SnapSelectionGesture(start, automatic && display(automatic.bounds));
     let lastPoint = start;
     setForceNew(false); setSelection(gesture.move(start));
@@ -604,32 +668,104 @@ export default function SpaceCanvas(props: Props) {
       lastPoint = end; setSelection(gesture.move(end, next.shiftKey, { x: next.clientX, y: next.clientY }));
     }, committed => {
       forceManualSelection = undefined;
-      const selected = selection(); setSelection(undefined);
-      if (!committed || disposed || props.scene.id !== sceneId || props.scene.background?.id !== backgroundId || !selected || (!gesture.isAutomatic && (selected.width < 8 || selected.height < 8))) return;
+      const selected = committed ? gesture.finish(lastPoint) : undefined; setSelection(undefined);
+      if (!committed) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, event, undefined, 1); return; }
+      if (disposed || props.scene.id !== sceneId || props.scene.background?.id !== backgroundId) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, event, undefined, 2); return; }
+      if (!selected || (!gesture.isAutomatic && (selected.width < 8 || selected.height < 8))) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, event, undefined, 3); return; }
       const left = Math.round((selected.x - offset.x) / scale), top = Math.round((selected.y - offset.y) / scale);
       const right = Math.round((selected.x + selected.width - offset.x) / scale), bottom = Math.round((selected.y + selected.height - offset.y) / scale);
       const region: Region = { id: crypto.randomUUID(), x: left, y: top, width: right - left, height: bottom - top };
-      const version = interactionVersion;
+      const version = interactionVersion, presentationEpoch = pendingSelectionEpoch;
+      let admitted = false;
+      const pending: PendingSelection = { sceneId, backgroundId, region, version, automatic: gesture.isAutomatic ? automatic : undefined, complete: false };
+      setPendingSelection(pending);
+      setPendingSelectionOutlines(previous => [...previous.slice(-15), pending]);
       setActive(region.id);
-      void Promise.resolve().then(() => props.onAddRegion(region)).then(() => {
-        if (props.scene.id !== sceneId || interactionVersion !== version) return;
-        if (gesture.isAutomatic) { snapshotSelections.bind(region, automatic); setSnapshotVersion(value => value + 1); }
-        revealToolbar(region); props.onSelectionComplete?.(region);
-      }).catch(error => props.onError(error instanceof Error ? error.message : '无法添加区域'));
+      if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, event);
+      void Promise.resolve().then(() => {
+        if (currentPendingSelection(pending)) { admitted = true; if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, undefined, undefined, 4); return props.onAddRegion(region); }
+        if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, undefined, undefined, 7);
+        removePendingOutline(pending);
+      }).then(() => {
+        if (admitted && drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, undefined, undefined, 5);
+        if (currentPendingSelection(pending)) setPendingSelection(current => current && { ...current, complete: true });
+      }).catch(error => {
+        removePendingOutline(pending);
+        if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionFinish, undefined, undefined, admitted ? 6 : 7);
+        if (!admitted || presentationEpoch !== pendingSelectionEpoch || !currentPendingSource(pending)) return;
+        if (currentPendingSelection(pending)) retirePendingSelection();
+        props.onError(error instanceof Error ? error.message : '无法添加区域');
+      });
+    }, () => !disposed && !document.hidden && !props.inputLocked && !props.blackboard && !props.scene.closed && !props.scene.frozen && !blocked()
+      && props.scene.id === sceneId && props.scene.background?.id === backgroundId && sameGeometry(geometry(), sourceGeometry) && geometry().scale === scale
+      && viewport().width === sourceViewport.width && viewport().height === sourceViewport.height && viewport().deviceScale === sourceViewport.deviceScale, true);
+  }
+  function currentPendingSource(pending: PendingSelection) {
+    return !disposed && !document.hidden && !props.inputLocked && !props.blackboard && !props.scene.closed && !props.scene.frozen
+      && props.scene.run?.status !== 'running' && props.scene.id === pending.sceneId && props.scene.background?.id === pending.backgroundId;
+  }
+  function currentPendingSelection(pending: PendingSelection) {
+    return currentPendingSource(pending) && interactionVersion === pending.version && pendingSelection()?.region.id === pending.region.id;
+  }
+  function removePendingOutline(pending: PendingSelection) {
+    setPendingSelectionOutlines(previous => previous.filter(value => value.region.id !== pending.region.id));
+  }
+  function retirePendingSelection() {
+    const pending = pendingSelection();
+    if (pending && active() === pending.region.id) setActive('');
+    setPendingSelection(undefined);
+  }
+  function clearPendingSelection() { pendingSelectionEpoch++; retirePendingSelection(); setPendingSelectionOutlines([]); }
+  function presentPendingSelection(id: string, element: HTMLElement) {
+    const pending = untrack(() => pendingSelectionOutlines().find(value => value.region.id === id));
+    if (!pending || pending.presented) return;
+    const epoch = pendingSelectionEpoch;
+    // Solid assigns ref before insertion. Keep the old outline until this exact
+    // saved section is connected; a snapshot alone is not a DOM handoff.
+    queueMicrotask(() => {
+      const saved = props.scene.regions.find(region => region.id === id);
+      if (epoch !== pendingSelectionEpoch || !element.isConnected || !currentPendingSource(pending) || !saved || saved.imageOverride || !sameGeometry(saved, pending.region)) return;
+      batch(() => {
+        setPendingSelectionOutlines(values => values.map(value => value === pending ? { ...value, presented: true } : value));
+        setPendingSelection(value => value?.region.id === id && value.version === pending.version && currentPendingSelection(value) ? { ...value, presented: true } : value);
+      });
     });
   }
+  function reconcilePendingSelection() {
+    const outlines = pendingSelectionOutlines();
+    const remaining = outlines.filter(pending => {
+      const saved = props.scene.regions.find(region => region.id === pending.region.id);
+      return currentPendingSource(pending) && !pending.presented && !(saved && (!sameGeometry(saved, pending.region) || saved.imageOverride));
+    });
+    if (remaining.length !== outlines.length) untrack(() => setPendingSelectionOutlines(remaining));
+    const pending = pendingSelection();
+    if (!pending) return;
+    const current = currentPendingSelection(pending), saved = props.scene.regions.find(region => region.id === pending.region.id);
+    untrack(() => {
+      if (!current) { clearPendingSelection(); return; }
+      if (saved && (!sameGeometry(saved, pending.region) || saved.imageOverride)) { removePendingOutline(pending); retirePendingSelection(); return; }
+      if (!saved) { if (pending.acknowledged) { removePendingOutline(pending); retirePendingSelection(); } return; }
+      if (!pending.complete || !pending.presented) { if (!pending.acknowledged) setPendingSelection({ ...pending, acknowledged: true }); return; }
+      setPendingSelection(undefined);
+      if (pending.automatic) { snapshotSelections.bind(saved, pending.automatic); setSnapshotVersion(value => value + 1); }
+      revealToolbar(saved); props.onSelectionComplete?.(saved);
+    });
+  }
+  createEffect(reconcilePendingSelection);
   function editRegion(event: PointerEvent, region: Region, handle?: Handle) {
     if (event.shiftKey || forceNew()) { begin(event); return; }
-    if (event.button !== 0 || activity() || blocked()) return;
-    if (deferGeometryPointer(event, () => { const saved = regionById(region.id); if (saved) editRegion(event, saved, handle); })) return;
+    if (event.button !== 0 || activity() || blocked()) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionEdit, event, undefined, 1); return; }
+    if (deferGeometryPointer(event, () => { const saved = regionById(region.id); if (saved) editRegion(event, saved, handle); })) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionEdit, event, undefined, 3); return; }
     endNudge();
     const target = geometryTarget(props.scene, region.id);
-    if (!target || !props.geometryController.beginPointer(target)) return;
+    if (!target || !props.geometryController.beginPointer(target)) { if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionEdit, event, undefined, 2); return; }
+    if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionEdit, event);
     setActiveItemId('');
     canvas.focus({ preventScroll: true });
     const original = target.geometry, scale = geometry().scale;
     const width = target.width, height = target.height, minimum = Math.max(1, Math.round(8 / scale));
     const startX = event.clientX, startY = event.clientY, sceneId = props.scene.id;
+    clearPendingSelection();
     setActive(region.id);
     trackPointer(event, next => {
       const dx = Math.round((next.clientX - startX) / scale), dy = Math.round((next.clientY - startY) / scale);
@@ -646,17 +782,18 @@ export default function SpaceCanvas(props: Props) {
       }
       props.geometryController.previewPointer(updated);
     }, committed => {
+      if (drawingDiagnosticsEnabled()) recordDrawingInput(DrawingInputPhase.regionEdit, event, undefined, committed ? 4 : 5);
       void props.geometryController.endPointer(committed && props.scene.id === sceneId).then(() => {
         const saved = regionById(region.id); if (!disposed && props.scene.id === sceneId && saved) revealToolbar(saved);
       }).catch(() => {});
     });
   }
-  const resize = () => { clearSnapPreview(); cancelDeferredPointer?.(); cancelGesture?.(); endNudge(); setViewport({ width: innerWidth, height: innerHeight, deviceScale: devicePixelRatio }); const region = activeRegion(); if (region && toolbarVisible()) placeToolbar(region); };
+  const resize = () => { clearPendingSelection(); clearSnapPreview(); cancelDeferredPointer?.(); cancelGesture?.(); endNudge(); setViewport({ width: innerWidth, height: innerHeight, deviceScale: devicePixelRatio }); const region = activeRegion(); if (region && toolbarVisible()) placeToolbar(region); };
   const leave = () => { clearSnapPreview(); scheduleHide(); };
-  const blur = () => { setCodeFocused(false); clearSnapPreview(); cancelDeferredPointer?.(); cancelGesture?.(); endNudge(); hideToolbar(); };
+  const blur = () => { clearPendingSelection(); setCodeFocused(false); clearSnapPreview(); cancelDeferredPointer?.(); cancelGesture?.(); endNudge(); hideToolbar(); };
   const codeFocus = () => setCodeFocused(!document.hidden);
   const snapFocus = (event: FocusEvent) => { if (event.target instanceof Element && event.target.closest('button,a,input,textarea,select,[contenteditable]:not([contenteditable="false"]),.composer,.video-trim-popover,.artifact-card,.selection-code-card,.ocr-text-layer')) clearSnapPreview(); };
-  const snapVisibility = () => { setCodeFocused(!document.hidden && document.hasFocus()); if (document.hidden) clearSnapPreview(); };
+  const snapVisibility = () => { setCodeFocused(!document.hidden && document.hasFocus()); if (document.hidden) { clearPendingSelection(); clearSnapPreview(); cancelDeferredPointer?.(); cancelGesture?.(); } };
   const snapMutations = new MutationObserver(() => { const modal = Boolean(document.querySelector('.modal-backdrop,.history-backdrop,.channel-popover,.reply-table-menu,[role="menu"]')); setCodeModal(modal); if (snapPreview() && modal) clearSnapPreview(); });
   snapMutations.observe(document.body, { childList: true, subtree: true });
   const recordKey = (event: KeyboardEvent) => {
@@ -729,7 +866,7 @@ export default function SpaceCanvas(props: Props) {
     else if (event.key.toLowerCase() === 'o') { const entry = ocrEntries()[0]; if (entry) { event.preventDefault(); runOcr(entry, region); } }
     else if (event.key.toLowerCase() === 't') { if (translationEntries().length || savedTranslation(region)) { event.preventDefault(); event.stopImmediatePropagation(); translate(region); } }
     else if (event.key.toLowerCase() === 'p') { const entry = pinEntries()[0]; if (entry) { event.preventDefault(); event.stopImmediatePropagation(); void runPin(entry, region); } }
-    else if (['c', 's', 'enter'].includes(event.key.toLowerCase())) { event.preventDefault(); event.stopImmediatePropagation(); void exportRegion(region, event.key.toLowerCase() !== 's', event.key === 'Enter'); }
+    else if (['c', 's', 'enter'].includes(event.key.toLowerCase())) { event.preventDefault(); event.stopImmediatePropagation(); if(event.key.toLowerCase()==='s'){const sceneId=props.scene.id,regionId=region.id;revealToolbar(region);queueMicrotask(()=>{if(!disposed&&props.scene.id===sceneId&&activeRegion()?.id===regionId&&!blocked()&&!exporting())openRegionImageExport?.();});}else void exportRegion(region, true, event.key === 'Enter'); }
     else if (!region.imageOverride && captureGrant()) { event.preventDefault(); props.onRecordRegion(region.id); }
   };
   const releaseKey = (event: KeyboardEvent) => {
@@ -776,7 +913,7 @@ export default function SpaceCanvas(props: Props) {
   const focusReference = (event: Event) => {
     const reference = (event as CustomEvent<Reference>).detail;
     if (reference?.kind === 'item') {
-      if (props.scene.items.some(item => item.id === reference.id)) setActiveItemId(reference.id);
+      if (props.scene.items.some(item => item.id === reference.id)) activateItem(reference.id);
       return;
     }
     if (reference?.kind !== 'region' || activity()) return;
@@ -798,6 +935,7 @@ export default function SpaceCanvas(props: Props) {
   document.addEventListener('focusin', snapFocus); document.addEventListener('visibilitychange', snapVisibility);
   onCleanup(() => {
     disposed = true;
+    clearPendingSelection();
     toolbarObserver?.disconnect();
     props.onCodeSource?.(undefined, false); window.removeEventListener('focus', codeFocus);
     snapLoader.dispose();
@@ -852,7 +990,9 @@ export default function SpaceCanvas(props: Props) {
     const source = `${props.scene.id}:${props.scene.background?.id ?? ''}:${props.scene.regions.map(value => `${value.id}:${value.imageOverride?.id ?? ''}`).join('|')}`;
     if (source === lastSource) return;
     lastSource = source;
-    untrack(() => { cancelDeferredPointer?.(); cancelGesture?.(); endNudge(); });
+    // A previous region's save does not change a new selection's pixel source.
+    // Existing-region move/resize gestures retain the strict list/source fence.
+    untrack(() => { cancelDeferredPointer?.(); if (!newSelectionSource?.()) cancelGesture?.(); endNudge(); });
   });
   createEffect(() => {
     const session = drawingSession();
@@ -883,9 +1023,9 @@ export default function SpaceCanvas(props: Props) {
     // Restoring a frozen scene begins with no hovered region; that is not cancellation.
     if (request && !props.scene.frozen && ((region && request.target.regionId !== region.id) || forceNew())) untrack(() => props.onTranslationCancel?.());
   });
-  async function crop(region: Region): Promise<Blob> {
+  async function crop(region: Region, variant: ImageExportVariant = 'annotated'): Promise<Blob> {
     if (!props.scene.background) throw new Error('没有截图');
-    if (region.drawings?.length || region.translation) throw new Error('请在桌面版导出带标注的图片');
+    if (variant === 'annotated' && (region.drawings?.length || region.translation)) throw new Error('请在桌面版导出带标注的图片');
     const source = region.imageOverride;
     const img = new window.Image(); img.crossOrigin = 'anonymous'; img.src = assetUrl(source ?? props.scene.background);
     await img.decode();
@@ -898,17 +1038,17 @@ export default function SpaceCanvas(props: Props) {
   function imageEditorBox(item:SpaceItem):Box {
     return imageObjectBox(item,viewport());
   }
-  async function exportImage(item:SpaceItem,copy:boolean,closeSpace=false):Promise<boolean> {
+  async function exportImage(item:SpaceItem,copy:boolean,closeSpace=false,variant:ImageExportVariant='annotated'):Promise<boolean> {
     if(exporting()||props.busy)return false;
     const sceneId=props.scene.id,itemId=item.id,assetId=item.asset.id;let fence:string|undefined;
     const saved=()=>props.scene.items.find(value=>value.id===itemId&&value.asset.id===assetId);
     const current=()=>!disposed&&props.scene.id===sceneId&&!props.scene.closed&&!props.scene.frozen&&Boolean(saved())&&(fence===undefined||JSON.stringify(saved())===fence);
     setExporting(true);props.onExportActivity?.(true);
-    try{return await finishCapture({prepare:async()=>{await props.onBeforeExport?.();fence=JSON.stringify(saved());},current,export:()=>exportImageItem(sceneId,itemId,assetId,copy),close:copy&&closeSpace?()=>props.onCopyClose?.(sceneId)??Promise.resolve(false):undefined});}
+    try{return await finishCapture({prepare:async()=>{await props.onBeforeExport?.();fence=JSON.stringify(saved());},current,export:()=>exportImageItem(sceneId,itemId,assetId,copy,copy?'annotated':variant),close:copy&&closeSpace?()=>props.onCopyClose?.(sceneId)??Promise.resolve(false):undefined});}
     catch(error){if(!disposed)props.onError(error instanceof Error?error.message:String(error));return false;}
     finally{if(!disposed){setExporting(false);props.onExportActivity?.(false);}}
   }
-  async function exportRegion(region: Region, copy: boolean, closeSpace = false): Promise<boolean> {
+  async function exportRegion(region: Region, copy: boolean, closeSpace = false, variant: ImageExportVariant = 'annotated'): Promise<boolean> {
     if (exporting() || props.busy) return false;
     const sceneId = props.scene.id, backgroundId = props.scene.background?.id;
     let fence: string | undefined;
@@ -921,9 +1061,9 @@ export default function SpaceCanvas(props: Props) {
     try {
       return await finishCapture({ prepare: async () => { await props.onBeforeExport?.(); const saved = props.scene.regions.find(value => value.id === region.id); if (saved) fence = stamp(saved); }, current, export: async () => {
         const savedRegion = props.scene.regions.find(value => value.id === region.id)!;
-        if (native) return exportNativeRegion(sceneId, region.id, copy);
+        if (native) return exportNativeRegion(sceneId, region.id, copy, copy ? 'annotated' : variant);
         else {
-          const blob = await crop(savedRegion);
+          const blob = await crop(savedRegion, copy ? 'annotated' : variant);
           if (!current()) return false;
           if (copy) await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
           else { const url = URL.createObjectURL(blob), link = document.createElement('a'); link.href = url; link.download = `截图_${new Date().toISOString().replace(/[:.]/g, '-')}.png`; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
@@ -934,22 +1074,28 @@ export default function SpaceCanvas(props: Props) {
     finally { if (!disposed) { setExporting(false); props.onExportActivity?.(false); } }
   }
   return <main ref={canvas} tabIndex={-1} class="space-canvas capture-surface" classList={{ 'capture-blackboard':props.blackboard, 'can-select': !props.blackboard&&Boolean(props.scene.background), 'capture-dragging': activity(), 'capture-add-mode': forceNew() }} onPointerDown={begin} aria-label={t("AI 空间")}>
+    <Show when={props.recordingSelection}><span class="capture-recording-hint" role="status">{t("框选录制范围")}</span></Show>
     <Show when={visibleCodes()}>{view => <SelectionCodeCard result={view().result} region={display(props.scene.regions.find(region => region.id === view().result.regionId)!)} toolbar={toolbarVisible() ? toolbarBox() : undefined} hidden={codesPaused()} disabled={Boolean(props.codeActionBusy)} onAction={(token, id, action) => props.onCodeAction?.(token, id, action) ?? Promise.resolve(false)} />}</Show>
     <Show when={!props.blackboard && pointerNative && props.scene.background}>{background => <PointerInspector sceneId={props.scene.id} background={background()} imageBox={geometry()} dimensions={pointerSelectionDimensions(selection(), geometry(), activeRegion())} disabled={props.busy || exporting() || props.scene.frozen || props.scene.closed || backgroundError() || Boolean(drawingSession() || imageDrawing() || pluginMenu() || ocrPending() || props.translationPending) || props.scene.regions.some(region => ocrVisible(region) || translationVisible(region))} blockedAt={(x, y) => toolbarVisible() && contains(toolbarBox(), x, y, TOLERANCE)} onReady={value => { pointerInspector = value; }} onError={props.onError} />}</Show>
-    <Show when={props.scene.background?.id} keyed>{id => <img class="screen-background capture-background" data-asset={id} src={assetUrl(props.scene.background!)} style={geometry().nativePixels ? { left: '0px', top: '0px', width: `${geometry().width}px`, height: `${geometry().height}px` } : undefined} alt={t("屏幕截图")} draggable={false} decoding="sync" onLoad={event => backgroundLoaded(event.currentTarget, id)} onError={() => backgroundFailed(id)} />}</Show>
+    <Show when={props.scene.background?.id} keyed>{id => <img ref={image => backgroundAttached(image, id)} class="screen-background capture-background" data-asset={id} src={assetUrl(props.scene.background!)} style={geometry().nativePixels ? { left: '0px', top: '0px', width: `${geometry().width}px`, height: `${geometry().height}px` } : undefined} alt={t("屏幕截图")} draggable={false} decoding="sync" onLoad={event => backgroundLoaded(event.currentTarget, id)} onError={event => backgroundFailed(event.currentTarget, id)} />}</Show>
     <svg class="capture-mask" width="100%" height="100%" aria-hidden="true">
       <defs><mask id="region-cutouts" maskUnits="userSpaceOnUse"><rect width="100%" height="100%" fill="white" />
-        <For each={regions()}>{entry => <rect x={entry.box.x} y={entry.box.y} width={entry.box.width} height={entry.box.height} fill="black" />}</For>
-        <Show when={selection()}>{box => <rect x={box().x} y={box().y} width={box().width} height={box().height} fill="black" />}</Show>
+        <For each={regionIds()}>{id => {
+          const region = createMemo(() => regionById(id)!);
+          const box = createMemo(() => display(region()), undefined, { equals: sameGeometry });
+          return <rect x={box().x} y={box().y} width={box().width} height={box().height} fill="black" />;
+        }}</For>
+        <Show when={selectionPreview()}>{box => <rect x={box().x} y={box().y} width={box().width} height={box().height} fill="black" />}</Show>
+        <For each={queuedSelectionPreviews()}>{pending => { const box = createMemo(() => display(pending.region)); return <rect x={box().x} y={box().y} width={box().width} height={box().height} fill="black" />; }}</For>
       </mask></defs>
       <rect width="100%" height="100%" fill="#000" fill-opacity={!props.blackboard&&props.scene.background ? props.maskOpacity : '0'} mask="url(#region-cutouts)" />
     </svg>
     <Show when={snapPreview()}>{box => <div class="capture-snap-preview" aria-hidden="true" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />}</Show>
-    <For each={props.scene.regions.map(region => region.id)}>{(id, index) => {
-      const region = () => regionById(id)!;
-      const box = () => display(region());
-      const image = () => imageProjection(region());
-      return <section class="capture-region" classList={{ 'capture-active': active() === id, 'capture-located': flashedRegion() === id, 'capture-image-override': Boolean(region().imageOverride) }} style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} onPointerDown={event => editRegion(event, region())} aria-label={`区域 ${index() + 1}`}>
+    <For each={regionIds()}>{(id, index) => {
+      const region = createMemo(() => regionById(id)!);
+      const box = createMemo(() => display(region()), undefined, { equals: sameGeometry });
+      const image = createMemo(() => imageProjection(region()));
+      return <section ref={element => presentPendingSelection(id, element)} class="capture-region" classList={{ 'capture-active': active() === id, 'capture-located': flashedRegion() === id, 'capture-image-override': Boolean(region().imageOverride) }} style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} onPointerDown={event => editRegion(event, region())} aria-label={`区域 ${index() + 1}`}>
         <div class="capture-region-content" style={{ left: `${image().box.x - box().x}px`, top: `${image().box.y - box().y}px`, width: `${image().box.width}px`, height: `${image().box.height}px` }}>
           <Show when={region().imageOverride?.id} keyed>{assetId => <img data-asset={assetId} class="capture-override-image" src={assetUrl(region().imageOverride!)} alt={t("长截图")} draggable={false} onError={() => props.onError('无法读取长截图')} />}</Show>
           <Show when={savedTranslation(region())}>{value => <TranslationLayer value={value()} active={active() === id && !drawingSession()} disabled={blocked()} onRemove={props.onTranslationRemove ? () => settledRegion(region(), saved => props.onTranslationRemove!(ocrTarget(saved))) : undefined} onError={props.onError} />}</Show>
@@ -966,15 +1112,16 @@ export default function SpaceCanvas(props: Props) {
       </section>;
     }}</For>
     <div class="capture-saved-drawings" aria-hidden="true">
-      <For each={props.scene.regions.map(region => region.id)}>{id => {
-        const region = () => regionById(id)!;
-        const image = () => imageProjection(region());
+      <For each={regionIds()}>{id => {
+        const region = createMemo(() => regionById(id)!);
+        const image = createMemo(() => imageProjection(region()));
         return <div class="capture-region-content" style={{ left: `${image().box.x}px`, top: `${image().box.y}px`, width: `${image().box.width}px`, height: `${image().box.height}px` }}>
-          <DrawingLayer hidden={drawingSession()?.regionId === id} region={image().region} sourceRegion={props.scene.regions.find(value => value.id === id)} sceneId={props.scene.id} background={props.scene.background} />
+          <DrawingLayer hidden={drawingSession()?.regionId === id} region={image().region} sourceRegion={savedRegions().get(id)} sceneId={props.scene.id} background={props.scene.background} />
         </div>;
       }}</For>
     </div>
-    <Show when={selection()}>{box => <div class="capture-selection" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />}</Show>
+    <Show when={selectionPreview()}>{box => <div class="capture-selection" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />}</Show>
+    <For each={queuedSelectionPreviews()}>{pending => { const box = createMemo(() => display(pending.region)); return <div class="capture-selection" data-pending-selection="queued" aria-hidden="true" style={{ left: `${box().x}px`, top: `${box().y}px`, width: `${box().width}px`, height: `${box().height}px` }} />; }}</For>
     <Show when={pingWheel()}>{wheel => (
       <svg class="ping-wheel" width={pingWheelSize()} height={pingWheelSize()} viewBox={`0 0 ${pingWheelSize()} ${pingWheelSize()}`} role="menu" aria-label={t('ping 轮盘')} style={{ left: `${wheel().x - pingWheelSize() / 2}px`, top: `${wheel().y - pingWheelSize() / 2}px` }}>
         <Show when={pingLol()} fallback={<g transform={`translate(${pingWheelSize() / 2} ${pingWheelSize() / 2})`}>
@@ -1057,12 +1204,12 @@ export default function SpaceCanvas(props: Props) {
       <button data-caption={t("录屏")} class="capture-record" title={t("区域录屏 · R")} aria-label={t("录制当前区域")} disabled={blocked() || Boolean(region().imageOverride)} onClick={() => props.onRecordRegion(region().id)}><Circle size={18} fill="currentColor" /></button>
       <span class="capture-separator" />
       <button data-caption={t("复制")} title={t("复制 · C")} aria-label={t("复制区域")} disabled={props.busy || exporting()} onClick={() => void exportRegion(region(), true)}><Copy size={18} /></button>
-      <button data-caption={t("保存")} title={t("保存 · S")} aria-label={t("保存区域")} disabled={props.busy || exporting()} onClick={() => void exportRegion(region(), false)}><Download size={18} /></button>
+      <ImageExportButton scope={JSON.stringify([props.scene.id,props.scene.background?.id,region().id,region().x,region().y,region().width,region().height,region().imageOverride?.id])} label={t('保存区域')} disabled={props.busy || exporting()} onRegister={open=>{openRegionImageExport=open;return()=>{if(openRegionImageExport===open)openRegionImageExport=undefined;};}} onOpenChange={value=>{setImageExportOpen(value);if(value){setPluginMenu(undefined);clearHideTimer();}else scheduleHide();}} onSelect={variant=>void exportRegion(region(),false,false,variant)} />
       <Show when={pinEntries().length}><button data-caption={t("贴图")} title={t("贴图 · P")} aria-label={t("贴图")} disabled={blocked()} onClick={() => pinEntries().length === 1 ? void runPin(pinEntries()[0], region()) : setPluginMenu(pluginMenu() === 'pin' ? undefined : 'pin')}><Pin size={18} /></button></Show>
       <Show when={pluginMenu()}><div class="capture-plugin-menu" classList={{ above: toolbarBox().y + toolbarBox().height + 228 > viewport().height }} role="menu"><For each={pluginMenu() === 'ocr' ? ocrEntries() : pluginMenu() === 'scroll' ? scrollEntries() : pluginMenu() === 'translation' ? translationEntries() : pluginMenu() === 'pin' ? pinEntries() : workflowEntries()}>{entry => <button role="menuitem" disabled={blocked()} onClick={event => entry.contribution.kind === 'selection.ocr' ? runOcr(entry, region()) : entry.contribution.kind === 'selection.scroll' ? runScroll(entry, region(), scrollMenuManual() || event.shiftKey) : entry.contribution.kind === 'selection.translation' ? runTranslation(entry, region()) : entry.contribution.kind === 'selection.pin' ? void runPin(entry, region()) : runWorkflow(entry, region())}>{entry.contribution.title}</button>}</For></div></Show>
     </div>}</Show>
-    <Show when={drawingSession() && regionById(drawingSession()!.regionId)}>{region => <DrawingEditor inputLocked={props.blackboard&&props.blackboardEnabled===false} onObjectWheel={props.blackboard?wheelObject:undefined} onObjectPointerMove={hoverObject} onObjectPointerLeave={()=>setHoveredObject('')} objects={props.blackboard?interactive=><div class="blackboard-artifact-layer"><ArtifactItems board interactive={interactive}/></div>:undefined} objectsFlush={props.blackboard?flushObjects:undefined} onRegisterObjectTrash={props.blackboard?registerObjectTrash:undefined} extraTools={props.blackboard ? () => <For each={workflowEntries()}>{entry => <button data-caption={entry.contribution.title} title={entry.contribution.title} aria-label={entry.contribution.title} disabled={blocked()} onClick={() => runWorkflow(entry,region())}><Table2 size={18}/></button>}</For> : undefined} onFinishBlackboard={props.onBlackboardClose} blackboard={props.blackboard} onRegisterHistory={props.onRegisterDrawingHistory} onRasterSnapshot={props.onRasterSnapshot} onRegisterFlush={props.onRegisterDrawingFlush} sceneId={drawingSession()!.sceneId} backgroundId={drawingSession()!.backgroundId} background={props.scene.background} region={imageProjection(region()).region} sourceRegion={props.scene.regions.find(value => value.id === region().id)} documentOnly={drawingSession()!.kind === 'document'} box={imageProjection(region()).box} scale={imageProjection(region()).scale} backgroundWidth={imageProjection(region()).width} backgroundHeight={imageProjection(region()).height} tools={drawingTools()} busy={props.busy} onPin={pinEntries().length ? () => runPin(pinEntries()[0], region()) : undefined} onCommand={command => { const session = drawingSession(); if (!session) return Promise.reject(Error('标注编辑已切换')); if (session.kind === 'document' || usesDrawingDocument(region(), command)) return props.onDrawingDocumentCommand(command); return props.onDrawingCommand(coreDrawingGrant.pluginId, coreDrawingGrant.revision, coreDrawingGrant.contributionId, command); }} onCopyTable={props.onCopyDrawingTable} onError={props.onError} onExport={(copy, closeSpace) => exportRegion(region(), copy, closeSpace)} onClose={closeDrawing} />}</Show>
-    <Show when={imageDrawingItem()}>{item => <ImageDrawingEditor sceneId={props.scene.id} item={item()} box={imageEditorBox(item())} busy={props.busy} inputLocked={props.inputLocked} onRegisterFlush={props.onRegisterDrawingFlush} onRegisterHistory={props.onRegisterDrawingHistory} onCopyTable={props.onCopyDrawingTable} onCommand={value=>props.onImageDrawingCommand?.(value)??Promise.reject(Error('图片编辑不可用'))} onClose={closeImageDrawing} onError={props.onError} onExport={(copy,closeSpace)=>exportImage(item(),copy,closeSpace)} onPin={props.onPinItem?async()=>await props.onPinItem!(item().id)!==false:undefined} />}</Show>
+    <Show when={drawingSession() && regionById(drawingSession()!.regionId)}>{region => <DrawingEditor inputLocked={props.blackboard&&props.blackboardEnabled===false} onObjectWheel={props.blackboard?wheelObject:undefined} onObjectPointerMove={hoverObject} onObjectPointerLeave={()=>setHoveredObject('')} objects={props.blackboard?interactive=><div class="blackboard-artifact-layer"><ArtifactItems board interactive={interactive}/></div>:undefined} objectsFlush={props.blackboard?flushObjects:undefined} onRegisterObjectTrash={props.blackboard?registerObjectTrash:undefined} extraTools={props.blackboard ? () => <For each={workflowEntries()}>{entry => <button data-caption={entry.contribution.title} title={entry.contribution.title} aria-label={entry.contribution.title} disabled={blocked()} onClick={() => runWorkflow(entry,region())}><Table2 size={18}/></button>}</For> : undefined} onFinishBlackboard={props.onBlackboardClose} blackboard={props.blackboard} onRegisterHistory={props.onRegisterDrawingHistory} onRasterSnapshot={props.onRasterSnapshot} onRegisterFlush={props.onRegisterDrawingFlush} sceneId={drawingSession()!.sceneId} backgroundId={drawingSession()!.backgroundId} background={props.scene.background} region={imageProjection(region()).region} sourceRegion={props.scene.regions.find(value => value.id === region().id)} documentOnly={drawingSession()!.kind === 'document'} box={imageProjection(region()).box} scale={imageProjection(region()).scale} backgroundWidth={imageProjection(region()).width} backgroundHeight={imageProjection(region()).height} tools={drawingTools()} busy={props.busy} onPin={pinEntries().length ? () => runPin(pinEntries()[0], region()) : undefined} onCommand={command => { const session = drawingSession(); if (!session) return Promise.reject(Error('标注编辑已切换')); if (session.kind === 'document' || usesDrawingDocument(region(), command)) return props.onDrawingDocumentCommand(command); return props.onDrawingCommand(coreDrawingGrant.pluginId, coreDrawingGrant.revision, coreDrawingGrant.contributionId, command); }} onCopyTable={props.onCopyDrawingTable} onError={props.onError} onExport={(copy, closeSpace, variant) => exportRegion(region(), copy, closeSpace, variant)} onClose={closeDrawing} />}</Show>
+    <Show when={imageDrawingItem()}>{item => <ImageDrawingEditor sceneId={props.scene.id} item={item()} box={imageEditorBox(item())} busy={props.busy} inputLocked={props.inputLocked} onRegisterFlush={props.onRegisterDrawingFlush} onRegisterHistory={props.onRegisterDrawingHistory} onCopyTable={props.onCopyDrawingTable} onCommand={value=>props.onImageDrawingCommand?.(value)??Promise.reject(Error('图片编辑不可用'))} onClose={closeImageDrawing} onError={props.onError} onExport={(copy,closeSpace,variant)=>exportImage(item(),copy,closeSpace,variant)} onPin={props.onPinItem?async()=>await props.onPinItem!(item().id)!==false:undefined} />}</Show>
     <Show when={!props.blackboard||!drawingSession()}><div class="artifact-layer"><ArtifactItems board={Boolean(props.blackboard)}/></div></Show>
   </main>;
 }

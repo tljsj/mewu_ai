@@ -4,6 +4,7 @@ import { referencePinObject, subscribePinObjects, type PinObject } from './pin-o
 import { syncNativeLanguage } from './language-bridge';
 import { t } from "./i18n";
 import { RunStreamBuffer } from './run-stream-buffer';
+import { PublishedRevision } from './published-revision';
 import { preferenceKey, readPreferences } from './interface-preferences';
 
 const composerPositionStorageKey = 'mewu.composer.position.v1';
@@ -48,6 +49,7 @@ import * as codeBridge from './code-bridge';
 import * as videoBridge from './video-bridge';
 import * as recordingAudioBridge from './recording-audio-bridge';
 import { RecordingAudioController, recordingAudioGrants, recordingGrant, sameAudioGrant, sameAudioSelection, validRecordingTrimGrant } from './recording-audio';
+import { RecordingSelection, type RecordingSelectionSource } from './recording-selection';
 import { validVideoDrawingGrant, coreVideoDrawingTools } from './core-drawing';
 import { VideoFlushRegistry, VideoPauseRegistry, VideoRequestLane, type VideoRequest } from './video-requests';
 import * as videoAnnotationBridge from './video-annotation-bridge';
@@ -151,6 +153,13 @@ export default function App() {
   const [focusRequest, setFocusRequest] = createSignal(0);
   const [recording, setRecording] = createSignal<bridge.RecordingStatus | null>(null);
   const [recordingReady, setRecordingReady] = createSignal(false);
+  const [recordingSelectionSource, setRecordingSelectionSource] = createSignal<RecordingSelectionSource>();
+  const recordingSelection = new RecordingSelection({
+    current: source => !disposed && !exitPreparing() && !recording() && !scroll()
+      && scene()?.id === source.sceneId && scene()?.background?.id === source.backgroundId
+      && !scene()?.closed && !scene()?.frozen && scene()?.run?.status !== 'running',
+    changed: setRecordingSelectionSource, start: startPreparedRecording, error: showError,
+  });
   let stopRecordingAudio: (() => void) | undefined, audioRead: Promise<void> | undefined;
   const [scroll, setScroll] = createSignal<scrollBridge.ScrollStatus | null>(null);
   const [scrollReady, setScrollReady] = createSignal(false);
@@ -233,6 +242,8 @@ export default function App() {
   let pendingPin: { requestId: string; canceled: boolean } | undefined;
   let pendingMediaPin: { canceled: boolean } | undefined;
   let disposed = false;
+  createEffect(() => { recordingSelectionSource(); recordingSelection.reconcile(); });
+  onCleanup(() => recordingSelection.clear());
   function codeMatches(source: CodeSource) {
     return !disposed && !exitPreparing() && !busy() && !recording() && !scroll() && document.visibilityState !== 'hidden' && codeSource(scene(), source.request.target.regionId, pluginSnapshot().plugins)?.key === source.key;
   }
@@ -343,7 +354,11 @@ export default function App() {
     setSnapshot(next);
     voice.reconcile();
     regionGeometry.reconcile();
+    publishedRevision.changed();
   };
+  const publishedRevision = new PublishedRevision(() => snapshot()?.revision,
+    async () => accept(await bridge.getSnapshot()));
+  onCleanup(() => publishedRevision.dispose());
   const acceptPlugins = (next: PluginSnapshot) => {
     if (!disposed && next.revision >= pluginSnapshot().revision) {
       if (next.revision !== pluginSnapshot().revision) videoPlayers.pauseAll();
@@ -522,14 +537,25 @@ export default function App() {
     finally { setBusy(false); finishOperation(); }
   }
   function drawingCommand(pluginId: string, pluginRevision: number, contributionId: string, value: DrawingCommand): Promise<void> {
-    if (exitPreparing() && (!drawingFlushDepth || !['add_drawing', 'update_drawing'].includes(value.type))) return Promise.reject(new Error('正在退出'));
+    if (exitPreparing() && (!drawingFlushDepth || !['add_drawing', 'update_drawing', 'undo_drawing', 'redo_drawing'].includes(value.type))) return Promise.reject(new Error('正在退出'));
     if (scroll()) return Promise.reject(new Error('长截图进行中'));
-    const next = commands.then(async () => { accept(await plugins.applyPluginDrawing(pluginId, pluginRevision, contributionId, value)); });
+    const next = commands.then(async () => {
+      const receipt = await plugins.applyPluginDrawing(pluginId, pluginRevision, contributionId, value);
+      if (typeof receipt === 'number') await publishedRevision.wait(receipt, () => {
+        const current = snapshot()?.scenes.find(scene => scene.id === value.sceneId);
+        const region = current?.regions.find(region => region.id === value.regionId);
+        // The host may publish a legal no-op with the same drawing revision.
+        // Exact drawing/history acknowledgment remains owned by the editor lane.
+        return current?.background?.id === value.backgroundId && Boolean(region)
+          && (region!.drawingRevision ?? 0) >= value.expectedRevision;
+      });
+      else accept(receipt);
+    });
     commands = next.catch(error => { if (exitPreparing()) exitFailure ??= error; });
     return next;
   }
   function drawingDocumentCommand(value: DrawingCommand): Promise<void> {
-    if (exitPreparing() && (!drawingFlushDepth || value.type !== 'update_drawing')) return Promise.reject(new Error('正在退出'));
+    if (exitPreparing() && (!drawingFlushDepth || !['update_drawing', 'undo_drawing', 'redo_drawing'].includes(value.type))) return Promise.reject(new Error('正在退出'));
     if (recording() || scroll()) return Promise.reject(new Error('当前无法编辑标注'));
     const next = commands.then(async () => {
       const current = scene(), region = current?.regions.find(region => region.id === value.regionId);
@@ -750,8 +776,20 @@ export default function App() {
     const current = scene(); if (!current || current.id !== sceneId) throw new Error('会话已变化');
     const text = draft(), references = refs().map(reference => ({ ...reference }));
     autosaveVersion++; clearTimeout(debounce);
-    await command({ type: 'set_draft', sceneId: current.id, draft: text });
-    await command({ type: 'set_refs', sceneId: current.id, refs: references });
+    // Keep this handoff's captured intent, but compare with the acknowledged
+    // host after earlier writes settle. Unchanged drafts/refs need no new full
+    // snapshot transaction when closing or switching an otherwise idle scene.
+    while (true) {
+      const pending = commands; await pending;
+      if (disposed || scene()?.id !== sceneId) throw new Error('会话已变化');
+      if (pending === commands) break;
+    }
+    const saved = snapshot(); if (!saved) throw new Error('会话尚未就绪');
+    const pending = pendingSceneDrafts(saved, { [sceneId]: text }, { [sceneId]: references });
+    for (const value of pending) {
+      if (disposed || scene()?.id !== sceneId) throw new Error('会话已变化');
+      await command(value);
+    }
   }
   async function flushDrawing(active: () => boolean, sceneId?: string) {
     drawingFlushDepth++;
@@ -862,14 +900,30 @@ export default function App() {
   }
   async function addRegion(sceneId: string, region: Region) {
     if (exitPreparing()) throw new Error('正在退出');
+    const backgroundId = snapshot()?.scenes.find(value => value.id === sceneId)?.background?.id;
+    if (!backgroundId) throw new Error('截图已变化');
     const finishOperation = spaceOperations.begin();
     try {
       await regionGeometry.flush();
-      await command({ type: 'add_region', sceneId, region });
-      const current = snapshot()!.scenes.find(s => s.id === sceneId)!;
-      const next = [...(referenceDrafts()[sceneId] ?? current.refs), { kind: 'region' as const, id: region.id }];
-      setReferenceDrafts(old => ({ ...old, [sceneId]: next }));
-      await command({ type: 'set_refs', sceneId, refs: next });
+      const save = commands.then(async () => {
+        const current = snapshot()?.scenes.find(value => value.id === sceneId);
+        if (disposed || exitPreparing() || scroll() || snapshot()?.activeSceneId !== sceneId
+          || !current || current.closed || current.frozen || current.background?.id !== backgroundId) throw new Error('截图已变化');
+        // Read after earlier queued additions, including unsaved reference edits.
+        const previousDraft = referenceDrafts()[sceneId];
+        const next = [...(previousDraft ?? current.refs), { kind: 'region' as const, id: region.id }];
+        const revision = await bridge.addCaptureRegion(sceneId, backgroundId, region, next);
+        if (revision !== undefined) await publishedRevision.wait(revision, () => {
+          const observed = snapshot()?.scenes.find(value => value.id === sceneId);
+          return observed?.background?.id === backgroundId && observed.regions.some(value => value.id === region.id);
+        });
+        // An explicit reference edit made while saving keeps its ownership.
+        if (!disposed && snapshot()?.scenes.find(value => value.id === sceneId)?.background?.id === backgroundId) {
+          setReferenceDrafts(old => old[sceneId] === previousDraft ? { ...old, [sceneId]: next } : old);
+        }
+      });
+      commands = save.catch(error => { if (exitPreparing()) exitFailure ??= error; });
+      await save;
     } finally { finishOperation(); }
   }
   function focusReference(reference: Reference) {
@@ -996,13 +1050,43 @@ export default function App() {
       await flush();
       if (disposed || exitPreparing() || scene()?.id !== current.id || scene()?.background?.id !== current.background.id || scene()?.closed || scene()?.frozen) throw new Error('录屏选区已变化');
       const prepared=await bridge.prepareWaylandRecording(current.id);
-      if(prepared){if(!disposed&&!exitPreparing())accept(prepared);return;}
+      if(prepared){if(!disposed&&!exitPreparing()){
+        accept(prepared);
+        const selected=prepared.scenes.find(value=>value.id===prepared.activeSceneId);
+        if(selected?.background)recordingSelection.arm({sceneId:selected.id,backgroundId:selected.background.id});
+      }return;}
       if (!sameAudioGrant(grant, recordingGrant())) throw new Error('屏幕录制已变化，请重试');
       if (!sameAudioSelection(audio, recordingAudio.selection())) throw new Error('声音设置已变化，请重新录屏');
       await bridge.startRecording(current.id, regionId, audio, grant);
       clearReferenceDraft(current.id);
     } catch (error) { showError(error); }
     finally { setBusy(false); finishOperation(); }
+  }
+  async function startPreparedRecording(source: RecordingSelectionSource, regionId: string) {
+    const current = scene();
+    if (disposed || busy() || !recordingReady() || recording() || scroll() || exitPreparing()
+      || !current || current.id !== source.sceneId || current.background?.id !== source.backgroundId
+      || current.closed || current.frozen || current.run?.status === 'running'
+      || !current.regions.some(region => region.id === regionId && !region.imageOverride)) throw Error('录屏选区已变化');
+    const grant = recordingGrant(), finishOperation = spaceOperations.begin();
+    setBusy(true);
+    try {
+      videoPlayers.pauseAll();
+      const audio = await recordingAudio.prepare();
+      await flush();
+      const latest = scene();
+      if (disposed || exitPreparing() || recording() || scroll() || !latest
+        || latest.id !== source.sceneId || latest.background?.id !== source.backgroundId
+        || latest.closed || latest.frozen || latest.run?.status === 'running'
+        || !latest.regions.some(region => region.id === regionId && !region.imageOverride)) throw Error('录屏选区已变化');
+      if (!sameAudioGrant(grant, recordingGrant())) throw Error('屏幕录制已变化，请重试');
+      if (!sameAudioSelection(audio, recordingAudio.selection())) throw Error('声音设置已变化，请重新录屏');
+      await bridge.startRecording(source.sceneId, regionId, audio, grant);
+      clearReferenceDraft(source.sceneId);
+    } finally { setBusy(false); finishOperation(); }
+  }
+  function selectionCompleted(region: Region) {
+    if (!recordingSelection.completed(region.id)) setFocusRequest(value => value + 1);
   }
   async function send() {
     const current = scene();
@@ -1066,8 +1150,10 @@ export default function App() {
     finally { setBusy(false); finishOperation(); }
   }
   async function cancel() {
-    if (!scene()) return;
-    try { accept(await bridge.cancelRun(scene()!.id)); }
+    const current = scene();
+    if (!current || current.run?.status !== 'running') return;
+    const runId = current.run.id;
+    try { accept(await bridge.cancelRun(current.id, runId)); }
     catch (error) { showError(error); }
   }
   async function continueJournal(summary: RunJournalSummary, decision: ContinuationDecision, selected?: string[]): Promise<boolean> {
@@ -1173,12 +1259,16 @@ export default function App() {
       {currentId => {
         // A keyed subtree owns this scene, even while activeSceneId changes.
         // Cleanup must not make its existing media read the next scene's items.
-        const initialScene=untrack(()=>scene()!);
-        const ownedScene=createMemo(()=>snapshot()?.scenes.find(value=>value.id===currentId)??initialScene);
+        let lastScene=untrack(()=>scene()!);
+        const ownedScene=createMemo(()=>{
+          const current=snapshot()?.scenes.find(value=>value.id===currentId);
+          if(current) lastScene=current;
+          return lastScene;
+        });
         const ownedRefs=()=>referenceDrafts()[currentId]??ownedScene().refs;
         const ownedDraft=()=>drafts()[currentId]??ownedScene().draft;
         return <Show when={!ownedScene().closed}>
-        <SpaceCanvas onRegisterObjectFlush={objectFlush.register} onPinItem={pinMediaItem} onActiveRegionChange={activeCaptureRegionChanged} blackboardEnabled={blackboardAvailable()} aiAvailable={agentReady()} onBlackboardReplay={replaySpace} blackboard={isBlackboard(ownedScene())} blackboardDrawing={blackboardEditing()===currentId} onBlackboardClose={finishBlackboard} onOpenBlackboard={blackboardAvailable()?id=>void reopenBlackboard(id):undefined} onRegisterDrawingHistory={registerDrawingHistory} onRasterSnapshot={accept} showButtonLabels={preferences().showButtonLabels} translationLanguage={preferences().translationLanguage} video={{ previewResolution: preferences().videoPreviewResolution, lane: videoLane, onRegisterPause: videoPlayers.register, onRegisterPlayer: videoNavigation.register, onPauseAll: videoPlayers.pauseAll.bind(videoPlayers), onAnnotationEdit: applyVideoAnnotation, onAnnotationTextEdit: applyVideoAnnotationText, drawing: { onApplyDrawing: applyVideoDrawing, onDocument: applyVideoDrawingDocument, onEditText: applyVideoDrawingText, onSnapshot: accept, onReadVector: videoDrawingBridge.getVideoAnnotationVector, onReadText: videoAnnotationBridge.getVideoAnnotationText, onRegisterDrawingAuthoringFlush: videoDrawingFlush.register }, onRegister: videoFlush.register, onEdit: applyVideoEdit, exporting: videoExport(), onCancelExport: cancelVideoExport, onError: showError }} onVideoExport={exportVideoItem} onVideoCopy={copyVideoItem} onCodeSource={acceptCodeSource} codeView={codeView()} codeActionBusy={codeActionBusy()} onCodeAction={codeAction} onRegisterDrawingFlush={drawingFlush.register} onExportActivity={setExportActive} onGeometryReplay={replayGeometry} onPin={createPin} onTranslationRemove={removeTranslation} translationPending={translations().find(value => value.request.target.sceneId === currentId)} translationNotice={translationNotices()[currentId]} onTranslationRequest={startTranslation} onTranslationCancel={() => translationRequests.cancelScene(currentId)} onClearTranslationNotice={() => setTranslationNotices(old => withoutScene(old, currentId))} onScrollCapture={startScroll} pingWheelTrigger={preferences().pingWheelTrigger} pingWheelSlots={preferences().pingWheelSlots} pingWheelMode={preferences().pingWheelMode} plugins={pluginSnapshot().plugins} onPluginWorkflow={runWorkflow} onDrawingCommand={drawingCommand} onDrawingDocumentCommand={drawingDocumentCommand} onImageDrawingCommand={command} onCopyDrawingTable={copyDrawingTable} onOcrRequest={request => plugins.runPluginOcr(request.requestId, request.pluginId, request.revision, request.contributionId, request.target)} onOcrCancel={plugins.cancelPluginOcr} onOcrResult={accept} scene={canvasScene(ownedScene())} refs={ownedRefs()} maskOpacity={preferences().maskOpacity} authoringBusy={busy() || sending()} inputLocked={exitPreparing()} busy={busy() || sending() || exitPreparing()} geometryController={regionGeometry} geometryView={geometryView()} onBeforeExport={flush} onCopyClose={closeScene} onRecordRegion={id => void startRecording(id)} onAddRegion={region => addRegion(currentId, region)} onSelectionActivity={setSelectionActive} onFocusComposer={() => setFocusRequest(v => v + 1)} onSelectionComplete={() => setFocusRequest(v => v + 1)} onRemoveRegion={id => removeReferenceObject('region', id)} onReference={toggleReference} onUpdateItem={item => command({ type: 'update_item', sceneId: currentId, item })} onRemoveItem={id => removeReferenceObject('item', id)} onError={showError} />
+        <SpaceCanvas recordingSelection={recordingSelectionSource()?.sceneId===currentId && recordingSelectionSource()?.backgroundId===ownedScene().background?.id} onRegisterObjectFlush={objectFlush.register} onPinItem={pinMediaItem} onActiveRegionChange={activeCaptureRegionChanged} blackboardEnabled={blackboardAvailable()} aiAvailable={agentReady()} onBlackboardReplay={replaySpace} blackboard={isBlackboard(ownedScene())} blackboardDrawing={blackboardEditing()===currentId} onBlackboardClose={finishBlackboard} onOpenBlackboard={blackboardAvailable()?id=>void reopenBlackboard(id):undefined} onRegisterDrawingHistory={registerDrawingHistory} onRasterSnapshot={accept} showButtonLabels={preferences().showButtonLabels} translationLanguage={preferences().translationLanguage} video={{ previewResolution: preferences().videoPreviewResolution, lane: videoLane, onRegisterPause: videoPlayers.register, onRegisterPlayer: videoNavigation.register, onPauseAll: videoPlayers.pauseAll.bind(videoPlayers), onAnnotationEdit: applyVideoAnnotation, onAnnotationTextEdit: applyVideoAnnotationText, drawing: { onApplyDrawing: applyVideoDrawing, onDocument: applyVideoDrawingDocument, onEditText: applyVideoDrawingText, onSnapshot: accept, onReadVector: videoDrawingBridge.getVideoAnnotationVector, onReadText: videoAnnotationBridge.getVideoAnnotationText, onRegisterDrawingAuthoringFlush: videoDrawingFlush.register }, onRegister: videoFlush.register, onEdit: applyVideoEdit, exporting: videoExport(), onCancelExport: cancelVideoExport, onError: showError }} onVideoExport={exportVideoItem} onVideoCopy={copyVideoItem} onCodeSource={acceptCodeSource} codeView={codeView()} codeActionBusy={codeActionBusy()} onCodeAction={codeAction} onRegisterDrawingFlush={drawingFlush.register} onExportActivity={setExportActive} onGeometryReplay={replayGeometry} onPin={createPin} onTranslationRemove={removeTranslation} translationPending={translations().find(value => value.request.target.sceneId === currentId)} translationNotice={translationNotices()[currentId]} onTranslationRequest={startTranslation} onTranslationCancel={() => translationRequests.cancelScene(currentId)} onClearTranslationNotice={() => setTranslationNotices(old => withoutScene(old, currentId))} onScrollCapture={startScroll} pingWheelTrigger={preferences().pingWheelTrigger} pingWheelSlots={preferences().pingWheelSlots} pingWheelMode={preferences().pingWheelMode} plugins={pluginSnapshot().plugins} onPluginWorkflow={runWorkflow} onDrawingCommand={drawingCommand} onDrawingDocumentCommand={drawingDocumentCommand} onImageDrawingCommand={command} onCopyDrawingTable={copyDrawingTable} onOcrRequest={request => plugins.runPluginOcr(request.requestId, request.pluginId, request.revision, request.contributionId, request.target)} onOcrCancel={plugins.cancelPluginOcr} onOcrResult={accept} scene={canvasScene(ownedScene())} refs={ownedRefs()} maskOpacity={preferences().maskOpacity} authoringBusy={busy() || sending()} inputLocked={exitPreparing()} busy={busy() || sending() || exitPreparing()} geometryController={regionGeometry} geometryView={geometryView()} onBeforeExport={flush} onCopyClose={closeScene} onRecordRegion={id => void startRecording(id)} onAddRegion={region => addRegion(currentId, region)} onSelectionActivity={setSelectionActive} onFocusComposer={() => setFocusRequest(v => v + 1)} onSelectionComplete={selectionCompleted} onRemoveRegion={id => removeReferenceObject('region', id)} onReference={toggleReference} onUpdateItem={item => command({ type: 'update_item', sceneId: currentId, item })} onRemoveItem={id => removeReferenceObject('item', id)} onError={showError} />
         <Show when={blackboardEditing()!==currentId}><PinObjectLayer exiting={exitPreparing()} aiAvailable={agentAvailable()} objects={pinObjects()} busy={busy()||sending()||exitPreparing()} referenced={pinReferenced} onReference={object=>void referencePin(object)} onError={showError}/></Show>
         <Show when={blackboardEditing()!==currentId}><nav class="space-utilities" aria-label={t('空间操作')}>
           <button class="icon-button" aria-label={t('退出')} title={t('退出')} disabled={busy()||exitPreparing()} onClick={()=>void closeScene(currentId)}><X size={17}/></button>

@@ -8,8 +8,10 @@ import type { Preferences } from './SettingsDialog';
 import { CapturePreferencesController, type CapturePreferencesView } from '../capture-preferences';
 import { settingsApi } from '../settings-bridge';
 import type { SettingsClient } from '../settings-client';
+import type { SettingsInfo } from '../settings-contracts';
 import { Row, Toggle } from './SettingControls';
 import RecordingAudioSettings from './RecordingAudioSettings';
+import SystemCaptureShortcutSetting from './SystemCaptureShortcutSetting';
 import type { PreviewResolution } from '../video-preview';
 import { DEFAULT_PING_WHEEL_SLOTS, DEFAULT_PING_WHEEL_TRIGGER, type PingWheelTriggerPref } from '../interface-preferences';
 import { PING_WHEEL_BUILTIN_ACTIONS } from './SpaceCanvas';
@@ -57,7 +59,7 @@ function PingTriggerField(props: { value: PingWheelTriggerPref; onChange: (value
   </span>;
 }
 
-export default function CaptureSettings(props: { active: boolean; preferences: Preferences; onPreferences: (value: Preferences) => void; api?: SettingsClient }) {
+export default function CaptureSettings(props: { active: boolean; preferences: Preferences; onPreferences: (value: Preferences) => void; platform?: SettingsInfo['platform']; api?: SettingsClient }) {
   const api = props.api ?? settingsApi;
   const [pane, setPane] = createSignal<'screenshot' | 'recording'>('screenshot');
   const [view, setView] = createSignal<CapturePreferencesView>({ pending: false, conflict: false, error: '' });
@@ -103,6 +105,7 @@ export default function CaptureSettings(props: { active: boolean; preferences: P
     <div class="segmented"><button aria-pressed={pane() === 'screenshot'} classList={{ selected: pane() === 'screenshot' }} onClick={() => setPane('screenshot')}><ScanLine size={13} />{t('截图')}</button><button aria-pressed={pane() === 'recording'} classList={{ selected: pane() === 'recording' }} onClick={() => setPane('recording')}><Video size={13} />{t('录屏')}</button></div>
     <div hidden={pane() !== 'screenshot'}>
     <Row title={t("截图快捷键")}><CaptureShortcutField visible={props.active && pane() === 'screenshot'} /></Row>
+    <Show when={props.platform === 'windows'}><SystemCaptureShortcutSetting active={props.active && pane() === 'screenshot'} api={api} /></Show>
     <Row title={t('翻译目标语言')}><select aria-label={t('翻译目标语言')} value={props.preferences.translationLanguage ?? 'zh-Hans'} onChange={event => props.onPreferences({ ...props.preferences, translationLanguage: event.currentTarget.value as TranslationLanguage })}><For each={translationLanguages}>{([language, label]) => <option value={language}>{t(label)}</option>}</For></select></Row>
     <Row title={t("选区外暗度")}><div class="range-field"><input aria-label={t("选区外暗度")} type="range" min=".3" max=".8" step=".01" value={props.preferences.maskOpacity} onInput={event => props.onPreferences({ ...props.preferences, maskOpacity: Number(event.currentTarget.value) })} /><output>{Math.round(props.preferences.maskOpacity * 100)}%</output></div></Row>
     <Row title={t("ping 轮盘触发键")}><PingTriggerField value={props.preferences.pingWheelTrigger ?? DEFAULT_PING_WHEEL_TRIGGER} onChange={value => props.onPreferences({ ...props.preferences, pingWheelTrigger: value })} /></Row>

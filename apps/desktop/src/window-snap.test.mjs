@@ -53,11 +53,16 @@ const map = roots => ({ version: 1, backgroundId: 'bg', width: 1200, height: 800
   assert.deepEqual(snapImagePoint(200, 125, image, .5), { x: 200, y: 100 });
   assert.equal(snapImagePoint(99, 125, image, .5), undefined); assert.equal(snapImagePoint(700, 125, image, .5), undefined); assert.equal(snapImagePoint(200, 475, image, .5), undefined);
   const candidate = box(110, 80, 300, 200), gesture = new SnapSelectionGesture({ x: 120, y: 90 }, candidate);
-  assert.deepEqual(gesture.move({ x: 124, y: 94 }), candidate); const dragged = gesture.move({ x: 124.01, y: 90 }); assert.ok(Math.abs(dragged.width - 4.01) < 1e-10); assert.equal(dragged.height, 0);
+  assert.deepEqual(gesture.move({ x: 120, y: 90 }), box(120, 90, 0, 0)); assert.equal(gesture.isAutomatic, false);
+  assert.deepEqual(gesture.move({ x: 124, y: 94 }), box(120, 90, 4, 4)); const dragged = gesture.move({ x: 124.01, y: 90 }); assert.ok(Math.abs(dragged.width - 4.01) < 1e-10); assert.equal(dragged.height, 0);
   assert.equal(gesture.isAutomatic, false); assert.deepEqual(gesture.move({ x: 120, y: 90 }), box(120, 90, 0, 0));
-  const edge = new SnapSelectionGesture({ x: 101, y: 100 }, candidate); edge.move({ x: 100, y: 100 }, false, { x: 80, y: 100 }); assert.equal(edge.isAutomatic, false);
-  const shift = new SnapSelectionGesture({ x: 120, y: 90 }, candidate); shift.forceManual(); assert.equal(shift.isAutomatic, false);
-  checks.push('Contain uses CSS coordinates without screen-origin/DPI multiplication; strict >4px per axis commits to manual mode even when dragged outside the clamped image');
+  assert.deepEqual(gesture.finish({ x: 120, y: 90 }), box(120, 90, 0, 0)); assert.equal(gesture.isAutomatic, false);
+  const click = new SnapSelectionGesture({ x: 120, y: 90 }, candidate); assert.deepEqual(click.move({ x: 120, y: 90 }), box(120, 90, 0, 0)); assert.equal(click.isAutomatic, false); assert.deepEqual(click.finish({ x: 120, y: 90 }), candidate); assert.equal(click.isAutomatic, true);
+  const jitter = new SnapSelectionGesture({ x: 120, y: 90 }, candidate); jitter.move({ x: 124, y: 94 }); assert.deepEqual(jitter.finish({ x: 124, y: 94 }), candidate); assert.equal(jitter.isAutomatic, true);
+  const edge = new SnapSelectionGesture({ x: 101, y: 100 }, candidate); edge.move({ x: 100, y: 100 }, false, { x: 80, y: 100 }); assert.deepEqual(edge.finish({ x: 100, y: 100 }), box(100, 100, 1, 0)); assert.equal(edge.isAutomatic, false);
+  const shift = new SnapSelectionGesture({ x: 120, y: 90 }, candidate); shift.forceManual(); assert.deepEqual(shift.finish({ x: 120, y: 90 }), box(120, 90, 0, 0)); assert.equal(shift.isAutomatic, false);
+  const manual = new SnapSelectionGesture({ x: 120, y: 90 }); assert.deepEqual(manual.finish({ x: 220, y: 190 }), box(120, 90, 100, 100)); assert.equal(manual.isAutomatic, false);
+  checks.push('Pointer down and drag show only manual bounds; an unmoved release alone confirms the fixed snap candidate, with 4 CSS px jitter tolerance and sticky Shift/outside/drag cancellation');
 }
 {
   const value = box(100, 100, 200, 150), target = box(104, 105, 200, 150);
@@ -85,6 +90,27 @@ const map = roots => ({ version: 1, backgroundId: 'bg', width: 1200, height: 800
   loader.request({ ...request, sceneId: 'E' }); loader.dispose(); jobs[3].resolve(map([])); await tick(); assert.equal(published.at(-1), undefined);
   const failed = [], silent = new SnapMapLoader(async () => { throw Error('unavailable'); }, value => failed.push(value)); silent.request(request); await tick(); assert.deepEqual(failed, [undefined, undefined]); silent.request(request); await tick(); assert.equal(failed.length, 2); silent.dispose();
   checks.push('One actual request plus only the latest identity survives scene changes; canceled/old replies cannot publish, unavailable maps stay silent and unmount rejects late completion');
+}
+{
+  const tick = () => new Promise(resolve => setImmediate(resolve));
+  const valid = map([node(1, box(0, 0, 20, 20))]);
+  for (const [fetch, expected] of [[async () => valid, [0, 1]], [async () => null, [1, 0]],
+    [async () => ({ invalid: true }), [2, 0]], [async () => { throw Error('private transport detail'); }, [3, 0]],
+    [() => { throw Error('private immediate detail'); }, [3, 0]]]) {
+    const observed = [], published = [];
+    const loader = new SnapMapLoader(fetch, value => published.push(value), () => (code, count) => observed.push([code, count]));
+    loader.request(request); await tick();
+    assert.deepEqual(observed, [expected]); assert.equal(Boolean(published.at(-1)), expected[0] === 0);
+    loader.request(request); await tick(); assert.equal(observed.length, 1); loader.dispose();
+  }
+  for (const getObserver of [() => undefined, () => { throw Error('observer unavailable'); }, () => () => { throw Error('observer unavailable'); }]) {
+    const published = [], loader = new SnapMapLoader(async () => valid, value => published.push(value), getObserver);
+    loader.request(request); await tick(); assert.equal(published.at(-1).roots.length, 1); loader.dispose();
+  }
+  let release; const observed = [];
+  const loader = new SnapMapLoader(() => new Promise(resolve => { release = resolve; }), () => {}, () => (...args) => observed.push(args));
+  loader.request(request); loader.dispose(); release(valid); await tick(); assert.deepEqual(observed, []);
+  checks.push('Opt-in observers classify only current completed maps into fixed pass/missing/invalid/transport numbers; disabled, throwing and stale observers cannot change the original map result or issue another request');
 }
 {
   let native = false; const calls = [];

@@ -442,7 +442,20 @@ pub(crate) async fn finish_blackboard(
 }
 
 #[tauri::command]
-pub(crate) fn open_blackboard(
+pub(crate) async fn open_blackboard(
+    app: AppHandle,
+    window: WebviewWindow,
+    scene_id: String,
+    item_id: String,
+) -> Result<HostSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_blackboard_blocking(app, window, scene_id, item_id)
+    })
+    .await
+    .map_err(|_| "黑板打开中断".to_string())?
+}
+
+fn open_blackboard_blocking(
     app: AppHandle,
     window: WebviewWindow,
     scene_id: String,
@@ -518,7 +531,7 @@ mod tests {
                 mewu_core::DrawingPoint { x: 56., y: 24. },
             ],
             text: None,
-            font_size: None,
+            font_size: None, text_style: None,
             origin: None,
             rich: None,
         });
@@ -676,7 +689,7 @@ mod tests {
                         mewu_core::DrawingPoint { x: 65., y: 30. },
                     ],
                     text: None,
-                    font_size: None,
+                    font_size: None, text_style: None,
                     origin: None,
                     rich: None,
                 },
@@ -756,7 +769,7 @@ mod tests {
                         mewu_core::DrawingPoint { x: 225., y: 60. },
                     ],
                     text: None,
-                    font_size: None,
+                    font_size: None, text_style: None,
                     origin: None,
                     rich: None,
                 },
@@ -884,7 +897,7 @@ mod tests {
                         mewu_core::DrawingPoint { x: 56., y: 24. },
                     ],
                     text: None,
-                    font_size: None,
+                    font_size: None, text_style: None,
                     origin: None,
                     rich: None,
                 },

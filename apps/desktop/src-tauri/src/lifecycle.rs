@@ -123,7 +123,7 @@ impl ExitState {
     }
     pub fn ensure_scene_command(&self, command: &SceneCommand) -> Result<(), String> {
         let phase = self.phase.load(Ordering::Acquire);
-        if (phase == RUNNING && !self.has_attempt())
+        if (phase == RUNNING && (!self.has_attempt() || is_manual_drawing_history(command)))
             || (phase <= PREPARING && is_exit_flush_command(command))
         {
             Ok(())
@@ -367,6 +367,19 @@ pub fn is_draft_command(command: &SceneCommand) -> bool {
 
 pub fn is_geometry_finish_command(command: &SceneCommand) -> bool {
     matches!(command, SceneCommand::FinishRegionGeometryEdit { .. })
+}
+
+// Accepted Undo/Redo intents may still be waiting behind a durable drawing
+// write when exit reserves input. The renderer drains these while RUNNING,
+// before begin_exit_preparation; they are never PREPARING flush commands.
+fn is_manual_drawing_history(command: &SceneCommand) -> bool {
+    matches!(command,
+        SceneCommand::UndoDrawing { .. } | SceneCommand::RedoDrawing { .. }
+        | SceneCommand::EditImageAnnotations {
+            action: mewu_core::ImageAnnotationEdit::UndoDrawing | mewu_core::ImageAnnotationEdit::RedoDrawing,
+            ..
+        }
+    )
 }
 
 pub fn is_exit_flush_command(command: &SceneCommand) -> bool {
@@ -762,6 +775,23 @@ fn start_shutdown(
             return;
         }
         if app.state::<Host>().exit.advance(&id, READY) {
+            // Stop only after reversible exit checks have succeeded. Request
+            // under Engine, then wait outside its lock and off the UI thread.
+            // FULL commits are already durable in WAL; stalled maintenance must
+            // not strand an irreversible exit. Process exit releases any final
+            // in-flight I/O before the next owner obtains the storage lock.
+            let maintenance = app.state::<Host>().lock().ok()
+                .map(|mut engine| engine.store.pause_checkpoint_maintenance());
+            if let Some(maintenance) = maintenance {
+                let _ = tokio::time::timeout(Duration::from_secs(5),
+                    tauri::async_runtime::spawn_blocking(move || maintenance.wait())).await;
+            }
+            // No reversible exit work remains. Release the screenshot key
+            // before installer/restart handoff; process exit is the final OS
+            // fallback if native hook teardown itself reports a failure.
+            if let Err(error) = crate::system_capture_shortcut::shutdown(&app) {
+                let _ = app.emit_to("settings", "host-error", error);
+            }
             // Workers and durable writes have drained. Presentation recovery
             // must not strand an irreversible exit; the OS destroys these HWNDs.
             #[cfg(windows)]
@@ -1475,7 +1505,7 @@ mod tests {
             stroke_width: 4.,
             points: vec![mewu_core::DrawingPoint { x: 10., y: 10. }],
             text: Some("已修改文字".into()),
-            font_size: Some(20.),
+            font_size: Some(20.), text_style: None,
             origin: None,
             rich: None,
         };
@@ -1500,6 +1530,10 @@ mod tests {
             expected_revision: 1,
             drawing_id: "text".into(),
         };
+        let remove_batch = SceneCommand::RemoveDrawings {
+            scene_id: "s".into(), background_id: "b".into(), region_id: "r".into(),
+            expected_revision: 1, drawing_ids: vec!["text".into(), "other".into()],
+        };
         let state = ExitState::default();
         let (id, _) = state.begin().unwrap();
         state.prepare_with("space", &id, || {}).unwrap();
@@ -1507,8 +1541,10 @@ mod tests {
         assert!(state.ensure_scene_command(&add).is_ok());
         assert!(state.ensure_scene_command(&update).is_ok());
         assert!(state.ensure_scene_command(&remove).is_err());
+        assert!(!is_exit_flush_command(&remove_batch));
+        assert!(state.ensure_scene_command(&remove_batch).is_err());
         assert!(state.advance(&id, DRAINING));
-        for command in [&add, &update, &remove] {
+        for command in [&add, &update, &remove, &remove_batch] {
             assert!(state.ensure_scene_command(command).is_err());
         }
         assert!(state.advance(&id, READY));
@@ -1520,10 +1556,10 @@ mod tests {
         use mewu_core::{Drawing,DrawingKind,DrawingPoint,ImageAnnotationEdit};
         let (mut store,scene_id)=item_geometry_store();
         let image=store.active_scene().unwrap().items[0].clone();
-        let drawing=Drawing { id:uuid::Uuid::new_v4().to_string(),kind:DrawingKind::Line,color:"#ff0000".into(),stroke_width:2.,points:vec![DrawingPoint{x:10.,y:10.},DrawingPoint{x:30.,y:30.}],text:None,font_size:None,origin:None,rich:None };
+        let drawing=Drawing { id:uuid::Uuid::new_v4().to_string(),kind:DrawingKind::Line,color:"#ff0000".into(),stroke_width:2.,points:vec![DrawingPoint{x:10.,y:10.},DrawingPoint{x:30.,y:30.}],text:None,font_size:None, text_style: None,origin:None,rich:None };
         let command=|action,revision|SceneCommand::EditImageAnnotations { scene_id:scene_id.clone(),item_id:image.id.clone(),source_asset_id:image.asset.id.clone(),expected_revision:revision,action };
         let state=ExitState::default();let(id,_)=state.begin().unwrap();state.prepare_with("space",&id,||{}).unwrap();
-        for action in [ImageAnnotationEdit::UndoDrawing,ImageAnnotationEdit::RedoDrawing,ImageAnnotationEdit::RemoveDrawing{drawing_id:drawing.id.clone()}] { let replay=command(action,0);assert!(!is_exit_flush_command(&replay));assert!(state.ensure_scene_command_with_store("space",&replay,&store).is_err()); }
+        for action in [ImageAnnotationEdit::UndoDrawing,ImageAnnotationEdit::RedoDrawing,ImageAnnotationEdit::RemoveDrawing{drawing_id:drawing.id.clone()},ImageAnnotationEdit::RemoveDrawings{drawing_ids:vec![drawing.id.clone()]}] { let replay=command(action,0);assert!(!is_exit_flush_command(&replay));assert!(state.ensure_scene_command_with_store("space",&replay,&store).is_err()); }
         let add=command(ImageAnnotationEdit::AddDrawing{drawing:drawing.clone()},0);assert!(is_exit_flush_command(&add));state.ensure_scene_command_with_store("space",&add,&store).unwrap();store.apply(add).unwrap();
         let saved=store.active_scene().unwrap().items[0].clone();let before=store.snapshot();
         assert!(store.apply(command(ImageAnnotationEdit::AddDrawing{drawing},0)).is_err());assert_eq!(store.snapshot(),before);
@@ -1531,6 +1567,32 @@ mod tests {
         let geometry=item_geometry_command(&scene_id,saved.clone());state.ensure_scene_command_with_store("space",&geometry,&store).unwrap();
         for modify in [0,1,2] {let mut forged=saved.clone();let doc=forged.image_annotations.as_mut().unwrap();match modify {0=>doc.revision+=1,1=>doc.drawings.clear(),_=>doc.source_asset_id=uuid::Uuid::new_v4().to_string()};assert!(state.ensure_scene_command_with_store("space",&item_geometry_command(&scene_id,forged),&store).is_err());}
         assert!(state.advance(&id,DRAINING));assert!(state.ensure_scene_command_with_store("space",&geometry,&store).is_err());
+    }
+
+    #[test]
+    fn reserved_manual_history_finishes_before_preparation_and_never_afterwards() {
+        let state = ExitState::default();
+        let (id, _) = state.begin().unwrap();
+        assert!(state.is_running() && state.has_attempt());
+        assert!(!state.accepts_new_operations());
+        let commands = [
+            SceneCommand::UndoDrawing { scene_id: "s".into(), background_id: "b".into(), region_id: "r".into(), expected_revision: 2 },
+            SceneCommand::RedoDrawing { scene_id: "s".into(), background_id: "b".into(), region_id: "r".into(), expected_revision: 3 },
+            SceneCommand::EditImageAnnotations { scene_id: "s".into(), item_id: "i".into(), source_asset_id: "b".into(), expected_revision: 2, action: mewu_core::ImageAnnotationEdit::UndoDrawing },
+            SceneCommand::EditImageAnnotations { scene_id: "s".into(), item_id: "i".into(), source_asset_id: "b".into(), expected_revision: 3, action: mewu_core::ImageAnnotationEdit::RedoDrawing },
+        ];
+        for command in &commands {
+            assert!(!is_exit_flush_command(command));
+            state.ensure_scene_command(command).unwrap();
+        }
+        assert!(state.ensure_scene_command(&SceneCommand::NewScene).is_err());
+        assert!(state.ensure_scene_command(&SceneCommand::RemoveDrawing { scene_id: "s".into(), background_id: "b".into(), region_id: "r".into(), expected_revision: 2, drawing_id: "d".into() }).is_err());
+        state.prepare_with("space", &id, || {}).unwrap();
+        for command in &commands { assert!(state.ensure_scene_command(command).is_err()); }
+        assert!(state.advance(&id, DRAINING));
+        for command in &commands { assert!(state.ensure_scene_command(command).is_err()); }
+        assert!(state.advance(&id, READY));
+        for command in &commands { assert!(state.ensure_scene_command(command).is_err()); }
     }
 
     #[test]

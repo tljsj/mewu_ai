@@ -37,7 +37,7 @@ function fixture(code) {
   const context = vm.createContext({
     Element, document:doc, effects, console,
     props:{onClose:()=>effect('close'),inputLocked:false,scene:{items:[]}},
-    cancelGesture:undefined, disabled:()=>false, edit:()=>undefined,textEditor:()=>undefined,confirmText:()=>effect('confirmText'),
+    cancelGesture:undefined, disabled:()=>false, historyDisabled:()=>false, edit:()=>undefined,textEditor:()=>undefined,confirmText:()=>effect('confirmText'),closeEditor:()=>effect('close'),
     exitPreparing:()=>false,settings:()=>false,pendingDrawingDrafts:()=>[],scroll:()=>undefined,recording:()=>undefined,
     busy:()=>false,sessionsOpen:()=>false,scene:()=>({id:'scene'}),expanded:()=>({}),closeScene:()=>effect('closeScene'),
     voicePending:()=>false, pendingPin:true,cancelPendingPin:()=>effect('cancelPin'),
@@ -47,7 +47,7 @@ function fixture(code) {
     closing:false,gesture:{end:()=>effect('end')},pin:{controlPin:value=>{effect(value.type);return Promise.resolve();}},report:()=>{},
     status:()=>({phase:'recording'}),stopOrCancel:()=>effect('stopRecording'),
     act:value=>effect(value),stopAnnotationPointer:()=>effect('stopPointer'),manualView:()=>({move:{}}),manual:{cancelMove:()=>effect('cancelMove')},
-    cancelPointer:()=>effect('cancelPointer'),
+    cancelPointer:()=>effect('cancelPointer'), controller:{isInteracting:()=>true},
   });
   // Compile the real shared guard in the same DOM realm as each real callback.
   vm.runInContext(helper+`\nglobalThis.run = ${code};`,context);

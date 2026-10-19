@@ -50,8 +50,8 @@ export default function ToolbarOwner(props) {
   ${['toolbarVisible', 'pluginMenu', 'extensionButtonCount', 'extensionInteracting', 'extensionRunning', 'blocked'].map(actualVariable).join('\n')}
   let hideTimer, cancelDeferredPointer, cancelGesture;
   const activeRegion = () => props.scene.regions[0], activity = () => false, forceNew = () => false;
-  const drawingSession = () => props.drawing, imageDrawing = () => props.imageDrawing, exporting = () => false, settling = () => false;
-  const setCodeFocused = () => {}, clearSnapPreview = () => {}, endNudge = () => {};
+  const drawingSession = () => props.drawing, imageDrawing = () => props.imageDrawing, exporting = () => false, settling = () => false, imageExportOpen = () => false;
+  const setCodeFocused = () => {}, clearPendingSelection = () => {}, clearSnapPreview = () => {}, endNudge = () => {};
   ${['clearHideTimer', 'hideToolbar', 'scheduleHide'].map(actualFunction).join('\n')}
   ${actualVariable('blur')}
   Object.assign(props.control, { blur, hideToolbar, leave: scheduleHide, reveal: () => setToolbarVisible(true) });
