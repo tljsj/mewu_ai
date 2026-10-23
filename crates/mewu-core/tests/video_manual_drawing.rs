@@ -198,6 +198,7 @@ fn text_layout() -> VerifiedVideoTextLayout {
     VerifiedVideoTextLayout::new(
         uid(),
         VideoTextContent {
+            text_box: None,
             text_style: None, version: 1,
             text: "答案：42".into(),
             color: "#F0F2F6".into(),
@@ -1086,6 +1087,7 @@ fn vector_cannot_borrow_an_old_layout_from_another_document_or_family() {
     let duplicate = VerifiedVideoTextLayout::new(
         r.layout_id,
         VideoTextContent {
+            text_box: None,
             text_style: None, version: 1,
             text: "literal".into(),
             color: "#112233".into(),
@@ -1206,6 +1208,7 @@ fn text_and_vector_current_and_history_use_one_png_byte_budget() {
             let l = VerifiedVideoTextLayout::new(
                 uid(),
                 VideoTextContent {
+                    text_box: None,
                     text_style: None, version: 1,
                     text: format!("literal{n}"),
                     color: "#112233".into(),
@@ -1353,7 +1356,7 @@ fn db8_to9_preserves_raw_payload_every_old_schema_and_raw_sql_row() {
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        10
+        11
     );
     for (kind, name, sql) in &schema {
         let actual: (String, Option<String>) = db
@@ -1570,7 +1573,7 @@ fn db8_running_recovery_is_explicit_and_never_claims_raw_preservation() {
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        10
+        11
     );
     assert!(rows(&db, "video_vector_layouts").is_empty());
     assert_eq!(rows(&db, "video_run_inputs").len(), 1);

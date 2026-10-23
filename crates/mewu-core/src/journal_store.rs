@@ -800,6 +800,30 @@ impl Store {
         self.journal_transaction(|db, state| respond(db, state, lease, result))
     }
 
+    /// Read only the real user source eligible for this prepared local save.
+    /// Used for bounded host correction data, never as replacement arguments.
+    pub fn local_memory_source_for_receipt(
+        &self,
+        lease: &DispatchLease,
+        source_message_id: &str,
+    ) -> Result<Option<String>> {
+        let (r, e, _) = j::leased(&self.db, lease)?;
+        live(&self.state, &r)?;
+        if e.summary.phase != ReceiptPhase::Prepared
+            || !matches!(&e.binding, Some(ToolBinding::Local { name }) if name == "memory_save") {
+            return Err(CoreError::JournalConflict);
+        }
+        local_memory_scope(&self.state, &r.scene, &r.id)?;
+        let scene = scope(&self.state, &r)?;
+        let current = scene.messages.iter().position(|message| message.id == r.user)
+            .ok_or(CoreError::JournalConflict)?;
+        let visible = scene.messages.get(scene.conversation_start.unwrap_or(0)..=current)
+            .ok_or(CoreError::JournalConflict)?;
+        Ok(crate::local_memory_sources(visible)
+            .find(|message| message.id == source_message_id)
+            .map(|message| message.text.clone()))
+    }
+
     pub fn apply_local_memory_with_receipt(
         &mut self,
         lease: &DispatchLease,
@@ -808,12 +832,13 @@ impl Store {
         let (result, receipt) = self.journal_transaction(|db, state| {
             let (r, e, _) = j::leased(db, lease)?;
             live(state, &r)?;
-            let (name, mutation, quote) = match effect {
+            let (name, mutation, quote, source_message_id) = match effect {
                 LocalMemoryEffect::Save {
                     id,
                     text,
                     expected_revision,
                     source_quote,
+                    source_message_id,
                 } => (
                     "memory_save",
                     MemoryMutation::Save {
@@ -822,6 +847,7 @@ impl Store {
                         expected_revision,
                     },
                     Some(source_quote),
+                    source_message_id,
                 ),
                 LocalMemoryEffect::Forget {
                     id,
@@ -833,6 +859,7 @@ impl Store {
                         expected_revision,
                     },
                     None,
+                    None,
                 ),
             };
             if e.summary.phase != ReceiptPhase::Prepared
@@ -840,18 +867,25 @@ impl Store {
             {
                 return Err(CoreError::JournalConflict);
             }
-            let (agent, source) = local_memory_scope(state, &r.scene, &r.id)?;
+            let (agent, mut source) = local_memory_scope(state, &r.scene, &r.id)?;
             if let Some(quote) = quote {
                 let quote = quote.trim();
+                let scene = scope(state, &r)?;
+                let current = scene.messages.iter().position(|m| m.id == r.user)
+                    .ok_or(CoreError::JournalConflict)?;
+                let start = scene.conversation_start.unwrap_or(0);
+                let visible = scene.messages.get(start..=current)
+                    .ok_or(CoreError::JournalConflict)?;
+                let source_id = source_message_id.as_deref().unwrap_or(&r.user);
+                let evidence = crate::local_memory_sources(visible)
+                    .find(|message| message.id == source_id);
                 if quote.is_empty()
                     || quote.chars().count() > 500
-                    || !scope(state, &r)?
-                        .messages
-                        .iter()
-                        .any(|m| m.id == r.user && m.text.contains(quote))
+                    || !evidence.is_some_and(|message| message.text.contains(quote))
                 {
-                    return Err(j::bad("记忆依据必须来自本轮用户输入"));
+                    return Err(CoreError::MemorySourceRequired);
                 }
+                source.message_id = source_id.to_owned();
             }
             crate::memory::mutate(db, &agent, mutation, Some(source))?;
             let result = local_result(if name == "memory_save" {
@@ -879,7 +913,7 @@ impl Store {
             let b=crate::external_memory::run_binding(db,state,&r.scene,&r.id,&grant)?;
             if !b.policy.explicit_retain{return Err(CoreError::MemoryDisabled)}
             if e.summary.phase!=ReceiptPhase::Prepared||quote.trim().is_empty()||quote.len()>64*1024{return Err(CoreError::JournalConflict)}
-            let user=scope(state,&r)?.messages.iter().find(|m|m.id==r.user&&m.text.contains(quote)).ok_or_else(||j::bad("只能保存本轮用户原文"))?;
+            let user=scope(state,&r)?.messages.iter().find(|m|m.id==r.user&&m.text.contains(quote)).ok_or(CoreError::MemorySourceRequired)?;
             let source=EvidenceSource{origin:EvidenceOrigin::UserQuote,scene_id:Some(r.scene.clone()),user_message_id:Some(r.user.clone()),assistant_message_id:None,run_id:Some(r.id.clone())};
             let payload=serde_json::to_string(&serde_json::json!({"version":1,"occurredAt":user.created_at,"parts":[{"role":"user","text":quote}]}))?;
             let queued=crate::external_memory::queue_evidence(db,&b,&format!("request:{}",e.summary.id),source,Some(payload),None)?;

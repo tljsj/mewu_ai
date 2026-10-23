@@ -3,6 +3,7 @@ import { t } from "../i18n";
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, untrack } from 'solid-js';
 import { Code2, Copy, Download, File, Image, Link2, Maximize2, Pencil, Pin, RotateCcw, Video, X } from 'lucide-solid';
 import ObjectMoveGrip from './ObjectMoveGrip';
+import { beginObjectDrag, type ObjectDrag } from '../extension-object-drag';
 import {objectMoveGripPosition} from '../object-move-grip';
 import type {ObjectTrashPort} from '../object-trash';
 import type {DrawingFlush,RegisterDrawingFlush} from '../drawing-flush';
@@ -60,7 +61,9 @@ export default function ArtifactCard(props: Props) {
   let gestureFlight:Promise<void>|undefined;
   let zoomTimer:ReturnType<typeof setTimeout>|undefined,zoomAsset:string|undefined;
   let textFlush:DrawingFlush|undefined;
-  const unregisterFlush=props.onRegisterFlush?.(async active=>{disposeGesture?.();await flushZoom();if(gestureFlight)await gestureFlight;if(textFlush)await textFlush(active);if(!active())throw Error('素材编辑已切换');});
+  const objectFlush:DrawingFlush=async active=>{disposeGesture?.();await flushZoom();if(gestureFlight)await gestureFlight;if(textFlush)await textFlush(active);if(!active())throw Error('素材编辑已切换');};
+  objectFlush.interacting=()=>Boolean(disposeGesture||gestureFlight||zoomAsset||pinning()||(textFlush&&textFlush.interacting?.()!==false));
+  const unregisterFlush=props.onRegisterFlush?.(objectFlush);
   const unregisterWheel=props.onRegisterWheel?.(wheel);
   const activate = () => props.onActivate?.();
   // An isolated iframe does not bubble its pointer events into this document.
@@ -157,11 +160,14 @@ export default function ArtifactCard(props: Props) {
     const vw = window.innerWidth, vh = window.innerHeight;
     const videoMode = isVideo();
     let changed = false;
+    let collection: ObjectDrag | undefined;
     if(props.blackboard&&!resize)props.trash?.begin();
     try{target.setPointerCapture(event.pointerId);}catch{props.trash?.cancel();return;}
     const move = (e: PointerEvent) => {
       if (!changed && Math.hypot(e.clientX - startX, e.clientY - startY) < 3) return;
       changed = true;
+      if (!resize && !collection && props.sceneId) collection = beginObjectDrag({ source: { kind: 'item', sceneId: props.sceneId, itemId: props.item.id }, remove: props.onRemove });
+      collection?.move({ x: e.clientX, y: e.clientY });
       setMoving(true);
       if(props.blackboard&&!resize)props.trash?.move({x:e.clientX,y:e.clientY});
       const dx = (e.clientX - startX) / vw, dy = (e.clientY - startY) / vh;
@@ -196,8 +202,9 @@ export default function ArtifactCard(props: Props) {
     const end = async (e: PointerEvent) => {
       cleanup();
       if (disposed || token !== gestureToken) return;
+      const collected = Boolean(e.type === 'pointerup' && collection?.finish({ x: e.clientX, y: e.clientY })); collection?.cancel();
       const remove=Boolean(props.blackboard&&!resize&&changed&&e.type==='pointerup'&&props.trash?.finish({x:e.clientX,y:e.clientY}));props.trash?.cancel();
-      if (changed && e.type !== 'pointercancel') {
+      if (changed && e.type !== 'pointercancel' && !collected) {
         const request=Promise.resolve().then(()=>remove?props.onRemove():props.onUpdate({ ...props.item, ...position() }));
         // Removal owns the app's full flush; registering it here would wait on itself.
         if(!remove)gestureFlight=request;
@@ -211,7 +218,7 @@ export default function ArtifactCard(props: Props) {
       setPosition(savedPosition());
       setMoving(false);
     };
-    const canceled=()=>{cleanup();props.trash?.cancel();setPosition(savedPosition());setMoving(false);};
+    const canceled=()=>{cleanup();collection?.cancel();props.trash?.cancel();setPosition(savedPosition());setMoving(false);};
     disposeGesture = canceled;
     target.addEventListener('pointermove', move);
     target.addEventListener('pointerup', end);

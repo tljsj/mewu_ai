@@ -10,9 +10,9 @@ export interface ScrollStatus {
   status: 'initial' | 'extended' | 'retraced' | 'unchanged' | 'low_information' | 'ambiguous' | 'lost_overlap' | 'limit_reached';
   stopHotkey: string;
   preview?:string;
-  // Normalized to the source monitor. The native HUD dims the surrounding
-  // monitor while retaining a real hole for every acquired pixel.
-  hud?: { outline: ScrollStatus['rect']; preview: ScrollStatus['rect'] | null; controls: ScrollStatus['rect'] | null };
+  // Normalized to the source monitor. retainMain is published only after the
+  // native aperture is verified; the HUD shades only the cloaked fallback.
+  hud?: { outline: ScrollStatus['rect']; preview: ScrollStatus['rect'] | null; controls: ScrollStatus['rect'] | null; live?: boolean; retainMain?: boolean };
   automatic?: boolean;
 }
 export type ScrollAction = 'finish' | 'keep' | 'cancel';
@@ -27,6 +27,10 @@ export async function controlScrollCapture(id: string, action: ScrollAction): Pr
   if (!native) throw new Error('请在桌面版使用长截图');
   return invoke('control_scroll_capture', { id, action });
 }
+export async function scrollSurfaceReady(id: string): Promise<void> {
+  if (!native) return;
+  await invoke('scroll_surface_ready', { id });
+}
 
 // Native events are emitted in order. The initial query can arrive after any event.
 export class ScrollStatusGate {
@@ -37,6 +41,8 @@ export class ScrollStatusGate {
     if (this.disposed || (next && this.ended.has(next.id))) return false;
     const ranks = { starting: 0, capturing: 1, finishing: 2 };
     if (next && this.current?.id === next.id && ranks[next.phase] < ranks[this.current.phase]) return false;
+    if (next && this.current?.id === next.id && this.current.hud?.live && !next.hud?.live) return false;
+    if (next && this.current?.id === next.id && this.current.hud?.live && Boolean(next.hud?.retainMain) !== Boolean(this.current.hud.retainMain)) return false;
     if (this.current && this.current.id !== next?.id) {
       this.ended.add(this.current.id);
       if (this.ended.size > 64) this.ended.delete(this.ended.values().next().value!);

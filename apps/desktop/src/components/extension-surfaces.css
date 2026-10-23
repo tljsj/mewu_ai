@@ -1,0 +1,5 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+.extension-surface-frame{position:fixed;bottom:74px;z-index:85;border:0;background:transparent;max-width:calc(100vw - 32px);max-height:calc(100vh - 98px);border-radius:16px;box-shadow:0 10px 40px #14213a38}
+@media(max-width:1000px){.extension-surface-frame{bottom:210px;max-height:calc(100vh - 234px)}}
+/* The parent owns external pointer drags, including release over a cross-origin document. */
+.extension-surface-frame.receiving-object{pointer-events:none}

@@ -1,8 +1,18 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=MEWU_BUILD_COMMIT");
+    // Cargo's PROFILE reports `release` for profiles inheriting release (daily
+    // included). Tauri's production feature controls embedding independently of
+    // optimization/debug_assertions. A fast local package must never depend on
+    // the developer's Vite process to display its windows.
+    if std::env::var("PROFILE").as_deref() == Ok("release") && tauri_build::is_dev() {
+        panic!("Production Mewu builds require --features tauri/custom-protocol (or tauri build)");
+    }
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_snapshot",
+            "register_control_renderer",
+            "claim_control_request",
+            "complete_control_request",
             "get_optional_capabilities",
             "create_blackboard",
             "finish_blackboard",
@@ -34,6 +44,8 @@ fn main() {
             "begin_exit_preparation",
             "finish_exit_preparation",
             "get_plugins",
+            "get_official_plugins",
+            "control_official_plugin",
             "get_extensions",
             "get_extension_bindings",
             "set_extension_binding",
@@ -44,15 +56,15 @@ fn main() {
             "install_extension",
             "control_extension",
             "invoke_extension",
+            "open_extension_surface_window",
+            "get_extension_surface_window",
+            "control_extension_surface_window",
+            "release_extension_surface_window",
+        "request_close_extension_surface_window",
+        "extension_surface_viewport_point",
+            "publish_extension_surface_targets",
+            "forward_extension_surface_event",
             "stop_extension",
-            "get_plugin_catalog",
-            "prepare_plugin",
-            "install_plugin",
-            "set_plugin_enabled",
-            "uninstall_plugin",
-            "rollback_plugin",
-            "reinstall_official_plugin",
-            "prepare_plugin_update",
             "run_plugin_workflow",
             "apply_plugin_drawing",
             "get_drawing_layout_preview",
@@ -87,6 +99,7 @@ fn main() {
             "get_scroll_status",
             "start_scroll_capture",
             "control_scroll_capture",
+            "scroll_surface_ready",
             "run_plugin_ocr",
             "get_voice_capabilities",
             "run_plugin_dictation",
@@ -140,6 +153,7 @@ fn main() {
             "hide_frozen_widget",
             "export_region",
             "export_image_item",
+            "export_control_image",
             "export_snapshot",
             "runtime_info",
             "freeze_space",
@@ -150,6 +164,7 @@ fn main() {
             "get_recording_audio",
             "set_recording_audio",
             "start_recording",
+            "recording_surface_ready",
             "recording_wayland_host_prepare",
             "control_recording",
             "export_video",

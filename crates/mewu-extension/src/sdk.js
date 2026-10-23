@@ -57,6 +57,11 @@ export function createContext(send) {
   });
   const ctx = Object.freeze({
     hostApi, host, storage,
+    runtime: Object.freeze({ describe: () => host.call('runtime.describe') }),
+    configuration: Object.freeze({
+      get: key => host.call('configuration.get', { key }),
+      compareAndSet: (key, expected, value) => host.call('configuration.compareAndSet', { key, expected, value })
+    }),
     commands: Object.freeze({ register: register('command') }),
     tools: Object.freeze({ register: register('tool') }),
     agents: Object.freeze({ register: register('agent') }),
@@ -65,7 +70,21 @@ export function createContext(send) {
     channels: Object.freeze({ register: register('channel') }),
     renderers: Object.freeze({ register: register('renderer') }),
     ui: Object.freeze({ register: register('ui'), render: value => host.call('ui.render', value) }),
+    objects: Object.freeze({
+      describe: () => host.call('objects.library.describe'),
+      get: () => host.call('objects.library.get'),
+      preview: (expectedRevision, id) => host.call('objects.library.preview', {expectedRevision, id}),
+      commit: transaction => host.call('objects.library.commit', transaction),
+      restore: (expectedRevision, id, position) => host.call('objects.library.restore', { expectedRevision, id, ...position })
+    }),
     model: Object.freeze({ invoke: request => host.call('model.invoke', request) }),
+    processes: Object.freeze({
+      resolve: (candidates, files = []) => host.call('process.resolve', { candidates, files }),
+      open: command => host.call('process.open', { command }),
+      write: (id, message, bindings) => host.call('process.write', { id, message, ...(bindings ? { bindings } : {}) }),
+      read: (id, timeoutMs = 250) => host.call('process.read', { id, timeoutMs }),
+      close: id => host.call('process.close', { id })
+    }),
     region: Object.freeze({
       observe: regionId => host.call('region.observe', { regionId }),
       action: (regionId, action) => host.call('region.action', { regionId, action })

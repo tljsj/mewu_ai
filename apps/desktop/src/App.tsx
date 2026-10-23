@@ -33,6 +33,7 @@ import { usesDrawingDocument } from './drawing-document';
 import type { DrawingLayoutTarget, DrawingTableFormat } from './drawing-layout-preview';
 import type { AgentProfile, ConnectionProfile, DiscoverMcpServer, Reference, Region, RunEvent, Scene, SceneCommand, Snapshot, VisualAnnotationGrant } from './contracts';
 import SpaceCanvas from './components/SpaceCanvas';
+import ExtensionSurfaces from './components/ExtensionSurfaces';
 import ExtensionSpaceCommands from './components/ExtensionSpaceCommands';
 const Composer = lazy(() => import('./components/Composer'));
 import SessionDock from './components/SessionDock';
@@ -69,6 +70,7 @@ import { VoiceInput, voiceLanguages, type VoiceScope } from './voice-input';
 import type { VoiceCapabilities, VoiceLanguage, VoicePending } from './voice-contracts';
 import { cancelPinOnEscape, preparePin } from './pin-interaction';
 import { nativeSelectOwnsEscape } from './native-select-escape';
+import { closeTopSurface } from './extension-surface-escape';
 import { TranslationRequests, translationScopeValid, type TranslationPending, type TranslationRequest } from './translation-request';
 import type { OcrTarget } from './contracts';
 import { ExitPreparation, pendingSceneDrafts, persistSceneDrafts, SpaceOperations } from './exit-preparation';
@@ -83,6 +85,7 @@ import DrawingDraftsDialog from './components/DrawingDraftsDialog';
 import { discardUnsavedDrawingDraft, listUnsavedDrawingDrafts, type PendingDrawingDraft } from './components/drawing-properties';
 import { ContinuationController } from './run-journal';
 import type { ContinuationDecision, RunJournalSummary } from './journal-contracts';
+import { AppControlError, attachAppControl, type AppControlMethod, type AppControlOperation, type AppControlParameters } from './app-control';
 
 
 function withoutScene<T>(values: Record<string, T>, sceneId: string): Record<string, T> {
@@ -162,6 +165,18 @@ export default function App() {
   });
   let stopRecordingAudio: (() => void) | undefined, audioRead: Promise<void> | undefined;
   const [scroll, setScroll] = createSignal<scrollBridge.ScrollStatus | null>(null);
+  // Keep the original decoded image during countdown and, when the native
+  // window has a real capture aperture, throughout long capture.
+  const capturePresentationLive = () => Boolean(
+    (recording() && (recording()!.phase !== 'starting' || recording()!.retainMain === true ||
+      recording()!.hud?.stage === 'mask' || recording()!.hud?.stage === 'live')) ||
+    (scroll() && (scroll()!.phase !== 'starting' || scroll()!.hud?.live === true))
+  );
+  const captureSceneBackgroundOnly = () => Boolean(
+    recording()?.phase === 'countdown' ||
+    (scroll()?.hud?.live && scroll()?.hud?.retainMain === true)
+  );
+  const captureSceneHidden = () => capturePresentationLive() && !captureSceneBackgroundOnly();
   const [scrollReady, setScrollReady] = createSignal(false);
   const [translations, setTranslations] = createSignal<TranslationPending[]>([]);
   const [translationNotices, setTranslationNotices] = createSignal<Record<string, { regionId: string; text: string }>>({});
@@ -237,6 +252,7 @@ export default function App() {
   let stopScrollEvents: (() => void) | undefined;
   let stopPluginEvents: (() => void) | undefined;
   let stopExitEvents: (() => void) | undefined;
+  let stopControlEvents: (() => void) | undefined;
   let stopTranslationEvents: (() => void) | undefined;
   let stopPinEscape: (() => void) | undefined;
   let pendingPin: { requestId: string; canceled: boolean } | undefined;
@@ -455,6 +471,36 @@ export default function App() {
       accept(await bridge.getSnapshot());
       try { const info = await bridge.runtimeInfo(); if (!disposed) setHotkey(info.hotkey); } catch { /* A missing status query does not block the space. */ }
     } catch (error) { showError(error); }
+    if (bridge.native && !disposed) {
+      // A development WebView can be connected to an older native process.
+      // Missing optional control commands must not break ordinary screenshot UI.
+      let rendererId: string | undefined;
+      try {
+        const stop = await attachAppControl({
+          current: () => {
+            const current = scene(), revision = snapshot()?.revision;
+            if (disposed || !current || revision === undefined) return;
+            return { sceneId: current.id, revision, backgroundId: current.background?.id,
+              draft: draft(), refs: refs(), runId: current.run?.id };
+          },
+          flush: flushControl,
+          claim: async request => {
+            if (disposed || !rendererId) throw new AppControlError('NOT_READY', '空间尚未就绪');
+            await bridge.claimControlRequest(rendererId, request.id, request.nonce);
+          },
+          execute: executeControl,
+          complete: async payload => {
+            if (!rendererId) throw new AppControlError('NOT_READY', '空间尚未就绪');
+            await bridge.completeControlRequest(rendererId, payload);
+          },
+        });
+        if (disposed) { stop(); return; }
+        stopControlEvents = stop;
+        const registration = await bridge.registerControlRenderer();
+        if (disposed) { stopControlEvents(); stopControlEvents = undefined; return; }
+        rendererId = registration.rendererId;
+      } catch { stopControlEvents?.(); stopControlEvents = undefined; }
+    }
   });
   onMount(() => { void readVoiceCapabilities(); });
   onMount(() => { void readRecordingAudio(); });
@@ -463,7 +509,7 @@ export default function App() {
   onCleanup(() => { stopVideoEvents?.(); void videoLane.dispose().catch(() => {}); });
   onMount(() => { if (codeBridge.codeNative) void codeBridge.subscribeCodeInvalidated(id => codes.invalidate(id)).then(stop => { if (disposed) stop(); else { stopCodeEvents = stop; setCodesReady(true); } }).catch(() => {}); });
   onCleanup(() => { codes.dispose(); stopCodeEvents?.(); });
-  onCleanup(() => { disposed = true; streamBuffer.dispose(); pinObjectsSubscription?.stop(); voice.dispose(); stopVoiceEvents?.(); regionGeometry.dispose(); cancelPendingPin(); stopPinEscape?.(); translationRequests.dispose(); stopTranslationEvents?.(); exitPreparation.dispose(); stopExitEvents?.(); stopEvents?.(); stopRecordingEvents?.(); stopScrollEvents?.(); stopPluginEvents?.(); clearTimeout(debounce); clearTimeout(errorTimer); });
+  onCleanup(() => { disposed = true; stopControlEvents?.(); streamBuffer.dispose(); pinObjectsSubscription?.stop(); voice.dispose(); stopVoiceEvents?.(); regionGeometry.dispose(); cancelPendingPin(); stopPinEscape?.(); translationRequests.dispose(); stopTranslationEvents?.(); exitPreparation.dispose(); stopExitEvents?.(); stopEvents?.(); stopRecordingEvents?.(); stopScrollEvents?.(); stopPluginEvents?.(); clearTimeout(debounce); clearTimeout(errorTimer); });
   createEffect(() => { voiceScope(); voice.reconcile(); });
   createEffect(on(() => scene()?.id, () => { voiceComposing = false; }));
   const voiceVisibility = () => { if (document.visibilityState === 'hidden') void voice.cancel().catch(showError); };
@@ -845,17 +891,17 @@ export default function App() {
       await Promise.all(pendingSceneDrafts(current, drafts(), referenceDrafts()).map(command));
     })().catch(showError); }, 350);
   }
-  async function switchScene(value: SceneCommand) {
-    if (busy() || recording() || scroll() || exitPreparing()) return;
+  async function switchScene(value: SceneCommand, strict = false) {
+    if (busy() || recording() || scroll() || exitPreparing()) { if (strict) throw new AppControlError('BUSY', '空间正在处理其他操作'); return; }
     const finishOperation = spaceOperations.begin();
     setBusy(true);
     try { await flush(); await command(value); setError(''); setSessionsOpen(false); setSelectionActive(false); setFocusRequest(v => v + 1); }
-    catch (error) { showError(error); }
+    catch (error) { showError(error); if (strict) throw error; }
     finally { setBusy(false); finishOperation(); }
   }
-  async function newConversation() {
+  async function newConversation(strict = false) {
     const current = scene();
-    if (!agentAvailable() || !current || busy() || sending() || recording() || scroll() || exitPreparing() || current.run?.status === 'running') return;
+    if (!agentAvailable() || !current || busy() || sending() || recording() || scroll() || exitPreparing() || current.run?.status === 'running') { if (strict) throw new AppControlError('BUSY', '当前无法新建对话'); return; }
     const sceneId = current.id;
     const oldDraft = draft();
     const finishOperation = spaceOperations.begin();
@@ -871,20 +917,20 @@ export default function App() {
       setSendErrors(old => withoutScene(old, sceneId));
       setExpanded(old => ({ ...old, [sceneId]: false }));
       setFocusRequest(value => value + 1);
-    } catch (error) { showError(error); }
+    } catch (error) { showError(error); if (strict) throw error; }
     finally { setBusy(false); finishOperation(); }
   }
-  async function freeze() {
-    if (busy() || recording() || scroll() || exitPreparing()) return;
-    const current = scene(); if (!current) return;
+  async function freeze(strict = false) {
+    if (busy() || recording() || scroll() || exitPreparing()) { if (strict) throw new AppControlError('BUSY', '当前无法最小化会话'); return; }
+    const current = scene(); if (!current) { if (strict) throw new AppControlError('NOT_READY', '会话尚未就绪'); return; }
     const finishOperation = spaceOperations.begin();
     setBusy(true);
     try { await flush(); accept(await bridge.freezeSpace(current.id)); }
-    catch (error) { showError(error); }
+    catch (error) { showError(error); if (strict) throw error; }
     finally { setBusy(false); finishOperation(); }
   }
-  async function closeScene(sceneId: string): Promise<boolean> {
-    if (busy() || recording() || scroll() || exitPreparing() || snapshot()?.scenes.find(scene => scene.id === sceneId)?.closed) return false;
+  async function closeScene(sceneId: string, strict = false): Promise<boolean> {
+    if (busy() || recording() || scroll() || exitPreparing() || snapshot()?.scenes.find(scene => scene.id === sceneId)?.closed) { if (strict) throw new AppControlError('BUSY', '当前无法关闭会话'); return false; }
     const finishOperation = spaceOperations.begin();
     const closingCurrent = scene()?.id === sceneId;
     setBusy(true); setClosingScene(sceneId);
@@ -895,7 +941,7 @@ export default function App() {
       setError('');
       if (closingCurrent) { setSessionsOpen(false); setSelectionActive(false); }
       return true;
-    } catch (error) { showError(error); return false; }
+    } catch (error) { showError(error); if (strict) throw error; return false; }
     finally { setClosingScene(undefined); setBusy(false); finishOperation(); }
   }
   async function addRegion(sceneId: string, region: Region) {
@@ -929,16 +975,16 @@ export default function App() {
   function focusReference(reference: Reference) {
     document.dispatchEvent(new CustomEvent('mewu:focus-reference', { detail: reference }));
   }
-  async function capture() {
-    if (busy() || recording() || scroll() || exitPreparing()) return; setBusy(true);
+  async function capture(strict = false) {
+    if (busy() || recording() || scroll() || exitPreparing()) { if (strict) throw new AppControlError('BUSY', '当前无法截图'); return; } setBusy(true);
     const finishOperation = spaceOperations.begin();
     try { await flush(); accept(await bridge.captureScreen()); }
-    catch (error) { showError(error); }
+    catch (error) { showError(error); if (strict) throw error; }
     finally { setBusy(false); finishOperation(); }
   }
-  async function openBlackboard() {
+  async function openBlackboard(strict = false) {
     const current=scene(), boardGrant=capabilities()?.blackboard;
-    if(!blackboardAvailable()||!current||busy()||sending()||recording()||scroll()||exitPreparing()||current.run?.status==='running')return;
+    if(!blackboardAvailable()||!current||busy()||sending()||recording()||scroll()||exitPreparing()||current.run?.status==='running'){if(strict)throw new AppControlError('BUSY','当前无法打开黑板');return;}
     if(isBlackboard(current)&&blackboardEditing()!==current.id){setBlackboardEditing(current.id);return;}
     const finish=spaceOperations.begin();setBusy(true);
     try{
@@ -951,22 +997,22 @@ export default function App() {
       if(!sameOptionalGrant(boardGrant,capabilities()?.blackboard)||scene()?.id!==current.id||disposed||exitPreparing())throw Error('会话已变化');
       const next=await bridge.createBlackboard(current.id);accept(next);
       if(!disposed&&isBlackboard(scene()))setBlackboardEditing(next.activeSceneId);
-    }catch(error){showError(error);}finally{setBusy(false);finish();}
+    }catch(error){showError(error);if(strict)throw error;}finally{setBusy(false);finish();}
   }
-  async function finishBlackboard():Promise<boolean>{
-    const current=scene();if(!current||!isBlackboard(current)||busy()||sending()||exitPreparing())return false;
+  async function finishBlackboard(strict=false):Promise<boolean>{
+    const current=scene();if(!current||!isBlackboard(current)||busy()||sending()||exitPreparing()){if(strict)throw new AppControlError('BUSY','当前无法完成黑板');return false;}
     const finish=spaceOperations.begin();setBusy(true);
     try{
       await flushDrawing(()=>!disposed&&scene()?.id===current.id,current.id);
       if(disposed||scene()?.id!==current.id||exitPreparing())throw Error('会话已变化');
       const next=await bridge.finishBlackboard(current.id);setReferenceDrafts(old=>withoutScene(old,next.activeSceneId));accept(next);setBlackboardEditing(undefined);setFocusRequest(value=>value+1);return true;
-    }catch(error){showError(error);return false;}finally{setBusy(false);finish();}
+    }catch(error){showError(error);if(strict)throw error;return false;}finally{setBusy(false);finish();}
   }
-  async function reopenBlackboard(itemId:string){
-    const current=scene(),boardGrant=capabilities()?.blackboard;if(!blackboardAvailable()||!current||busy()||sending()||recording()||scroll()||exitPreparing()||current.run?.status==='running')return;
+  async function reopenBlackboard(itemId:string,strict=false){
+    const current=scene(),boardGrant=capabilities()?.blackboard;if(!blackboardAvailable()||!current||busy()||sending()||recording()||scroll()||exitPreparing()||current.run?.status==='running'){if(strict)throw new AppControlError('BUSY','当前无法打开黑板');return;}
     const finish=spaceOperations.begin();setBusy(true);
     try{await flush();if(!sameOptionalGrant(boardGrant,capabilities()?.blackboard)||disposed||scene()?.id!==current.id||exitPreparing())throw Error('会话已变化');const next=await bridge.openBlackboard(current.id,itemId);accept(next);setBlackboardEditing(next.activeSceneId);}
-    catch(error){showError(error);}finally{setBusy(false);finish();}
+    catch(error){showError(error);if(strict)throw error;}finally{setBusy(false);finish();}
   }
   const canReplaySpace=(redo:boolean)=>{
     const controls=drawingHistoryControls();if(controls)return redo?controls.canRedo():controls.canUndo();
@@ -1035,13 +1081,13 @@ export default function App() {
     catch (error) { showError(error); }
     finally { if (!disposed) setBusy(false); finishOperation(); }
   }
-  async function startRecording(regionId: string) {
+  async function startRecording(regionId: string, strict = false): Promise<'started' | 'selection-required' | undefined> {
     const current = scene();
-    if (!current || busy() || recording() || scroll() || exitPreparing() || current.run?.status === 'running') return;
+    if (!current || busy() || recording() || scroll() || exitPreparing() || current.run?.status === 'running') { if (strict) throw new AppControlError('BUSY', '当前无法录屏'); return; }
     const grant = recordingGrant();
-    if (!bridge.native) { showError('仅桌面版可录屏'); return; }
-    if (!recordingReady()) { showError('录屏状态尚未就绪'); return; }
-    if (!current.background || !current.regions.some(region => region.id === regionId && !region.imageOverride)) return;
+    if (!bridge.native) { if (strict) throw new AppControlError('NOT_READY', '仅桌面版可录屏'); showError('仅桌面版可录屏'); return; }
+    if (!recordingReady()) { if (strict) throw new AppControlError('NOT_READY', '录屏状态尚未就绪'); showError('录屏状态尚未就绪'); return; }
+    if (!current.background || !current.regions.some(region => region.id === regionId && !region.imageOverride)) { if (strict) throw new AppControlError('CONFLICT', '录屏选区已变化'); return; }
     setBusy(true);
     const finishOperation = spaceOperations.begin();
     try {
@@ -1054,12 +1100,13 @@ export default function App() {
         accept(prepared);
         const selected=prepared.scenes.find(value=>value.id===prepared.activeSceneId);
         if(selected?.background)recordingSelection.arm({sceneId:selected.id,backgroundId:selected.background.id});
-      }return;}
+      }return 'selection-required';}
       if (!sameAudioGrant(grant, recordingGrant())) throw new Error('屏幕录制已变化，请重试');
       if (!sameAudioSelection(audio, recordingAudio.selection())) throw new Error('声音设置已变化，请重新录屏');
       await bridge.startRecording(current.id, regionId, audio, grant);
       clearReferenceDraft(current.id);
-    } catch (error) { showError(error); }
+      return 'started';
+    } catch (error) { showError(error); if (strict) throw error; }
     finally { setBusy(false); finishOperation(); }
   }
   async function startPreparedRecording(source: RecordingSelectionSource, regionId: string) {
@@ -1088,9 +1135,9 @@ export default function App() {
   function selectionCompleted(region: Region) {
     if (!recordingSelection.completed(region.id)) setFocusRequest(value => value + 1);
   }
-  async function send() {
+  async function send(strict = false, controlInput?: AppControlParameters['chat.send']) {
     const current = scene();
-    if (!agentReady() || !current || busy() || recording() || scroll() || sending() || exitPreparing() || current.run?.status === 'running' || (!draft().trim() && refs().length === 0)) return;
+    if (!agentReady() || !current || busy() || recording() || scroll() || sending() || exitPreparing() || current.run?.status === 'running' || (!(controlInput?.text ?? draft()).trim() && (controlInput?.refs ?? refs()).length === 0)) { if (strict) throw new AppControlError('BUSY', '当前无法发送消息'); return; }
     const candidateGrant = visualAnnotationGrant();
     let grant: VisualAnnotationGrant | undefined;
     const identity = annotationSendIdentity(current);
@@ -1099,7 +1146,7 @@ export default function App() {
     const check = (text: string, references: Reference[]) => {
       if (!agentReady() || disposed || exitPreparing() || scene()?.id !== current.id || scene()?.closed || scene()?.frozen) throw new Error('会话已变化');
       if (grant) assertAnnotationSend({ identity, sourceIdentity, grant, scene: scene(), references, draft: text, plugins: pluginSnapshot().plugins, active: !recording() && !scroll() });
-      if (regionId && (chatRegion(scene(), references, activeCaptureRegions()[current.id]) !== regionId || chatRegionIdentity(scene(), regionId) !== regionIdentity)) throw new Error('截图选区已变化');
+      if (regionId && (chatRegion(scene(), references, controlInput?.regionId ?? activeCaptureRegions()[current.id]) !== regionId || chatRegionIdentity(scene(), regionId) !== regionIdentity)) throw new Error('截图选区已变化');
     };
     const finishOperation = spaceOperations.begin();
     const stopVoice = voice.cancel();
@@ -1111,8 +1158,11 @@ export default function App() {
       await flushDrawing(() => !disposed && scene()?.id === id, id);
       await regionGeometry.flush();
       if (scene()?.id !== id) throw new Error('会话已变化');
-      const submittedDraft = draft(), submittedRefs = refs().map(reference => ({ ...reference }));
-      regionId = chatRegion(scene(), submittedRefs, activeCaptureRegions()[id]);
+      if (controlInput?.expectedDraft !== undefined && draft() !== controlInput.expectedDraft) throw new AppControlError('CONFLICT', '对话草稿已变化');
+      if (controlInput?.expectedRefs !== undefined && JSON.stringify(refs()) !== JSON.stringify(controlInput.expectedRefs)) throw new AppControlError('CONFLICT', '截图引用已变化');
+      const submittedDraft = controlInput?.text ?? draft(), submittedRefs = (controlInput?.refs ?? refs()).map(reference => ({ ...reference }));
+      regionId = chatRegion(scene(), submittedRefs, controlInput?.regionId ?? activeCaptureRegions()[id]);
+      if (controlInput?.regionId !== undefined && regionId !== controlInput.regionId) throw new AppControlError('CONFLICT', '截图引用已变化');
       regionIdentity = chatRegionIdentity(scene(), regionId);
       // Enable available tools for the committed references; the model chooses
       // whether to use them. Keep the revision captured before asynchronous work.
@@ -1132,15 +1182,15 @@ export default function App() {
       accept(next);
       if (snapshot()?.scenes.find(scene => scene.id === id)?.closed) return;
       setDrafts(old => old[id] !== undefined && old[id] !== submittedDraft ? old : ({ ...old, [id]: next.scenes.find(s => s.id === id)?.draft || '' }));
-    } catch (error) { if (exitPreparing()) exitFailure ??= error; if (!snapshot()?.scenes.find(scene => scene.id === id)?.closed) setSendErrors(old => ({ ...old, [id]: error instanceof Error ? error.message : String(error) })); }
+    } catch (error) { if (exitPreparing()) exitFailure ??= error; if (!snapshot()?.scenes.find(scene => scene.id === id)?.closed) setSendErrors(old => ({ ...old, [id]: error instanceof Error ? error.message : String(error) })); if (strict) throw error; }
     finally { setSending(false); finishOperation(); }
   }
-  async function startScroll(pluginId: string, revision: number, contributionId: string, target: OcrTarget, snapshotNodeId?: number) {
+  async function startScroll(pluginId: string, revision: number, contributionId: string, target: OcrTarget, snapshotNodeId?: number, strict = false) {
     const current = scene();
-    if (!current || current.id !== target.sceneId || busy() || recording() || scroll() || sending() || exitPreparing() || current.run?.status === 'running') return;
+    if (!current || current.id !== target.sceneId || busy() || recording() || scroll() || sending() || exitPreparing() || current.run?.status === 'running') { if (strict) throw new AppControlError('BUSY', '当前无法长截图'); return; }
     if (!bridge.native) throw new Error('请在桌面版使用长截图');
     if (!scrollReady()) throw new Error('长截图状态尚未就绪');
-    if (current.regions.find(region => region.id === target.regionId)?.imageOverride) return;
+    if (current.regions.find(region => region.id === target.regionId)?.imageOverride) { if (strict) throw new AppControlError('CONFLICT', '长截图选区已变化'); return; }
     const finishOperation = spaceOperations.begin(); setBusy(true);
     try {
       await flush();
@@ -1149,12 +1199,183 @@ export default function App() {
     } catch (error) { if (exitPreparing()) exitFailure ??= error; throw error; }
     finally { setBusy(false); finishOperation(); }
   }
-  async function cancel() {
+  async function cancel(strict = false, expectedRunId?: string) {
     const current = scene();
-    if (!current || current.run?.status !== 'running') return;
+    if (!current || current.run?.status !== 'running' || (expectedRunId !== undefined && current.run.id !== expectedRunId)) { if (strict) throw new AppControlError('CONFLICT', '回答已结束或被替换'); return; }
     const runId = current.run.id;
     try { accept(await bridge.cancelRun(current.id, runId)); }
-    catch (error) { showError(error); }
+    catch (error) { showError(error); if (strict) throw error; }
+  }
+  function assertControlIdle() {
+    if (disposed || exitPreparing() || !scene()) throw new AppControlError('NOT_READY', '空间尚未就绪');
+    if (busy() || sending() || (selectionActive() && !drawingFlush.idle(scene()!.id, scene()?.background?.id)) || drawingFlush.interacting() || objectFlush.interacting()
+      || exportActive() || geometryView().held || recording() || scroll()) {
+      throw new AppControlError('BUSY', '空间正在处理其他操作');
+    }
+  }
+  async function flushControl() {
+    assertControlIdle();
+    const finish = spaceOperations.begin();
+    setBusy(true);
+    try { await flush(); }
+    finally { setBusy(false); finish(); }
+  }
+  function controlReceipt(extra: Record<string, unknown> = {}) {
+    const saved = snapshot(), current = saved?.scenes.find(value => value.id === saved.activeSceneId);
+    if (!saved || saved.revision === undefined || !current) throw new AppControlError('NOT_READY', '空间尚未就绪');
+    return { sceneId: current.id, revision: saved.revision, backgroundId: current.background?.id ?? null, ...extra };
+  }
+  async function withControlBusy<T>(work: () => Promise<T>): Promise<T> {
+    assertControlIdle();
+    const finish = spaceOperations.begin(); setBusy(true);
+    try { return await work(); }
+    finally { setBusy(false); finish(); }
+  }
+  async function setControlReferences(value: Reference[]) {
+    const current = scene(); if (!current) throw new AppControlError('NOT_READY', '会话尚未就绪');
+    if (value.some(reference => reference.kind === 'region' ? !current.regions.some(region => region.id === reference.id) : !current.items.some(item => item.id === reference.id))) throw new AppControlError('CONFLICT', '引用对象已变化');
+    const previous = referenceDrafts()[current.id];
+    const saved = value.map(reference => ({ ...reference }));
+    setReferenceDrafts(old => ({ ...old, [current.id]: saved }));
+    try { await command({ type: 'set_refs', sceneId: current.id, refs: saved }); }
+    catch (error) {
+      setReferenceDrafts(old => old[current.id] !== saved ? old : previous === undefined ? withoutScene(old, current.id) : { ...old, [current.id]: previous });
+      throw error;
+    }
+  }
+  async function executeControl<M extends AppControlMethod>(method: M, params: AppControlParameters[M]): Promise<unknown> {
+    const operation = { method, params } as AppControlOperation;
+    if (disposed || !scene()) throw new AppControlError('NOT_READY', '空间尚未就绪');
+    // Native claim already checked the exact request nonce, renderer lifetime
+    // and plugin revision. Keep the ordinary product gates for every action.
+    const nativeControl = operation.method === 'recording.control' || operation.method === 'scroll.control' || operation.method === 'chat.cancel';
+    if (!nativeControl) assertControlIdle();
+    switch (operation.method) {
+      case 'capture.open':
+        await capture(true); return controlReceipt();
+      case 'region.add': {
+        await withControlBusy(() => addRegion(scene()!.id, operation.params.region));
+        // Match the UI's saved-region completion, including a Portal request
+        // explicitly waiting for a new region on its newly authorized frame.
+        selectionCompleted(operation.params.region);
+        return controlReceipt({ regionId: operation.params.region.id });
+      }
+      case 'chat.setDraft':
+        await withControlBusy(async () => { setDraft(operation.params.text); await flush(); });
+        return controlReceipt({ draftSaved: true });
+      case 'chat.send': {
+        const sceneId = scene()!.id, previousRunId = scene()!.run?.id;
+        await send(true, operation.params);
+        const run = snapshot()?.scenes.find(value => value.id === sceneId)?.run;
+        if (!run || run.id === previousRunId) throw new AppControlError('OPERATION_FAILED', '回答尚未开始');
+        return controlReceipt({ runId: run.id, runStatus: run.status });
+      }
+      case 'chat.cancel':
+        await cancel(true, operation.params.expectedRunId);
+        return controlReceipt({ runId: operation.params.expectedRunId, canceled: true });
+      case 'blackboard.create':
+        if (isBlackboard(scene())) setBlackboardEditing(scene()!.id);
+        else await openBlackboard(true);
+        return controlReceipt({ blackboard: true });
+      case 'blackboard.finish':
+        await finishBlackboard(true); return controlReceipt({ blackboard: false });
+      case 'blackboard.open':
+        await reopenBlackboard(operation.params.itemId, true); return controlReceipt({ blackboard: true });
+      case 'drawing.apply': {
+        const value = operation.params.command;
+        await withControlBusy(async () => {
+          const region = scene()?.regions.find(region => region.id === value.regionId);
+          if (!region) throw new AppControlError('CONFLICT', '标注目标已变化');
+          if (usesDrawingDocument(region, value)) await drawingDocumentCommand(value);
+          else await drawingCommand(coreDrawingGrant.pluginId, coreDrawingGrant.revision, coreDrawingGrant.contributionId, value);
+        });
+        const region = scene()?.regions.find(region => region.id === value.regionId);
+        return controlReceipt({ regionId: value.regionId, drawingRevision: region?.drawingRevision ?? 0 });
+      }
+      case 'recording.start': {
+        const started = await startRecording(operation.params.regionId, true);
+        if (started === 'selection-required') return controlReceipt({ recordingStatus: null, requiresSelection: true });
+        const status = await bridge.getRecordingStatus();
+        if (!status) throw new AppControlError('OPERATION_FAILED', '录屏尚未开始');
+        return controlReceipt({ recordingStatus: status });
+      }
+      case 'recording.control': {
+        await bridge.controlRecording(operation.params.id, operation.params.action);
+        const status = await bridge.getRecordingStatus();
+        return controlReceipt({ recordingId: operation.params.id, recordingStatus: status });
+      }
+      case 'scroll.start': {
+        const value = operation.params;
+        await startScroll(value.pluginId, value.revision, value.contributionId, value.target, value.snapshotNodeId, true);
+        const status = await bridge.getScrollStatus();
+        if (!status) throw new AppControlError('OPERATION_FAILED', '长截图尚未开始');
+        return controlReceipt({ scrollStatus: { id: status.id, phase: status.phase, width: status.width, height: status.height, status: status.status } });
+      }
+      case 'scroll.control': {
+        await scrollBridge.controlScrollCapture(operation.params.id, operation.params.action === 'stop' ? 'finish' : 'cancel');
+        const status = await bridge.getScrollStatus();
+        return controlReceipt({ scrollId: operation.params.id, scrollStatus: status ? { id: status.id, phase: status.phase, width: status.width, height: status.height, status: status.status } : null });
+      }
+      case 'scene.activate':
+        await switchScene({ type: 'activate_scene', sceneId: operation.params.sceneId }, true); return controlReceipt();
+      case 'scene.new':
+        await switchScene({ type: 'new_scene' }, true); return controlReceipt();
+      case 'scene.newConversation':
+        await newConversation(true); return controlReceipt();
+      case 'scene.freeze':
+        await freeze(true); return controlReceipt();
+      case 'scene.close':
+        await closeScene(scene()!.id, true); return controlReceipt();
+      case 'scene.command': {
+        const value = operation.params.command;
+        if (value.type === 'remove_region') await removeReferenceObject('region', value.regionId, true);
+        else if (value.type === 'remove_item') await removeReferenceObject('item', value.itemId, true);
+        else await withControlBusy(() => command(value));
+        return controlReceipt();
+      }
+      case 'references.set':
+        await withControlBusy(() => setControlReferences(operation.params.refs)); return controlReceipt({ referencesSaved: true });
+      case 'settings.open':
+        await bridge.openSettings(); return controlReceipt({ settingsOpened: true });
+      case 'asset.import': {
+        const sceneId = scene()!.id, before = new Set(scene()!.items.map(item => item.id));
+        await withControlBusy(async () => {
+          const saved = await bridge.importAssets(sceneId, operation.params.paths);
+          if (disposed || scene()?.id !== sceneId) throw new AppControlError('CONFLICT', '导入会话已变化');
+          clearReferenceDraft(sceneId); accept(saved);
+        });
+        const items = scene()!.items.filter(item => !before.has(item.id)).map(item => ({ itemId: item.id, assetId: item.asset.id, kind: item.asset.kind, name: item.asset.name }));
+        if (!items.length) throw new AppControlError('OPERATION_FAILED', '没有导入文件');
+        return controlReceipt({ items });
+      }
+      case 'image.export': {
+        const value = operation.params;
+        const output = await withControlBusy(() => bridge.exportControlImage(scene()!.id, value.regionId, value.path, value.variant));
+        return controlReceipt({ output });
+      }
+      case 'ocr.run': {
+        const value = operation.params;
+        await withControlBusy(async () => accept(await plugins.runPluginOcr(crypto.randomUUID(), value.pluginId, value.revision, value.contributionId, value.target)));
+        const document = scene()?.regions.find(region => region.id === value.target.regionId)?.ocr?.document;
+        if (!document) throw new AppControlError('OPERATION_FAILED', '文字识别回执无效');
+        return controlReceipt({ regionId: value.target.regionId, text: document.lines.map(line => line.text).join('\n') });
+      }
+      case 'translation.run': {
+        const value = operation.params, language = value.language ?? preferences().translationLanguage ?? 'zh-Hans';
+        await withControlBusy(async () => accept(await translationBridge.runTranslation({ requestId: crypto.randomUUID(), pluginId: value.pluginId, revision: value.revision, contributionId: value.contributionId, target: value.target, language })));
+        const translation = scene()?.regions.find(region => region.id === value.target.regionId)?.translation;
+        if (!translation) throw new AppControlError('OPERATION_FAILED', '翻译回执无效');
+        return controlReceipt({ regionId: value.target.regionId, overlayId: translation.overlay.id, language: translation.document.targetLanguage, text: translation.document.lines.map(line => line.text).join('\n') });
+      }
+      case 'pin.create': {
+        const value = operation.params, region = scene()?.regions.find(region => region.id === value.target.regionId);
+        if (!region) throw new AppControlError('CONFLICT', '置顶目标已变化');
+        const result = await withControlBusy(() => pinBridge.runPin({ requestId: crypto.randomUUID(), pluginId: value.pluginId, revision: value.revision, contributionId: value.contributionId, target: value.target,
+          translationId: value.translationId === undefined ? region.translation?.overlay.id ?? null : value.translationId }));
+        if (!result?.id) throw new AppControlError('OPERATION_FAILED', '置顶回执无效');
+        return controlReceipt({ pinId: result.id });
+      }
+    }
   }
   async function continueJournal(summary: RunJournalSummary, decision: ContinuationDecision, selected?: string[]): Promise<boolean> {
     if (!agentReady()) return false;
@@ -1199,21 +1420,22 @@ export default function App() {
     setPreferences(value);
     try { localStorage.setItem(preferenceKey, JSON.stringify(value)); } catch { /* The current session remains usable when storage is disabled. */ }
   }
-  async function removeReferenceObject(kind: 'region' | 'item', id: string) {
-    if (exitPreparing() || busy()) return;
+  async function removeReferenceObject(kind: 'region' | 'item', id: string, strict = false) {
+    if (exitPreparing() || busy()) { if (strict) throw new AppControlError('BUSY', '当前无法移除引用对象'); return; }
     const sceneId = scene()!.id;
     const finishOperation = spaceOperations.begin(); setBusy(true);
     try {
       await flush();
       await command(kind === 'region' ? { type: 'remove_region', sceneId, regionId: id } : { type: 'remove_item', sceneId, itemId: id });
       setReferenceDrafts(old => ({ ...old, [sceneId]: (old[sceneId] ?? refs()).filter(ref => !(ref.kind === kind && ref.id === id)) }));
-    } catch (error) { showError(error); }
+    } catch (error) { showError(error); if (strict) throw error; }
     finally { setBusy(false); finishOperation(); }
   }
   const escape = (event: KeyboardEvent) => {
     if (nativeSelectOwnsEscape(event)) return;
     if (exitPreparing()) return;
     if (event.key !== 'Escape' || settings() || pendingDrawingDrafts().length) return;
+    if (!event.isComposing && closeTopSurface()){event.preventDefault();return;}
     const activeScroll = scroll();
     if (activeScroll) {
       event.preventDefault();
@@ -1254,7 +1476,7 @@ export default function App() {
   onCleanup(() => { document.removeEventListener('keydown', videoExportEscape, true); document.removeEventListener('keydown', pinEscape, true); document.removeEventListener('keydown', escape); });
 
   return <div class="app" inert={exitPreparing()} classList={{ 'recording-active': Boolean(recording()), 'scroll-active': Boolean(scroll()), 'reduce-motion': preferences().reduceMotion, 'text-small': preferences().textSize === 'small', 'text-large': preferences().textSize === 'large' }}>
-    <Show when={!recording() && !scroll()} fallback={<><Show when={recording()}>{status => <RecordingBackdrop status={status()} maskOpacity={preferences().maskOpacity} />}</Show><Show when={scroll()}>{status => <ScrollBackdrop status={status()} maskOpacity={preferences().maskOpacity} />}</Show></>}>
+    <div class="capture-scene-surface" classList={{ 'capture-background-only': captureSceneBackgroundOnly() }} inert={Boolean(recording() || scroll())} style={{ display: captureSceneHidden() ? 'none' : 'contents' }}>
     <Show when={scene()?.id} keyed fallback={<div class="startup-state"><Show when={!error()} fallback={<><CircleAlert size={19} /><span>{error()}</span><button onClick={() => location.reload()}>{t("重新载入")}</button></>}><LoaderCircle size={20} class="spin" /></Show></div>}>
       {currentId => {
         // A keyed subtree owns this scene, even while activeSceneId changes.
@@ -1268,7 +1490,7 @@ export default function App() {
         const ownedRefs=()=>referenceDrafts()[currentId]??ownedScene().refs;
         const ownedDraft=()=>drafts()[currentId]??ownedScene().draft;
         return <Show when={!ownedScene().closed}>
-        <SpaceCanvas recordingSelection={recordingSelectionSource()?.sceneId===currentId && recordingSelectionSource()?.backgroundId===ownedScene().background?.id} onRegisterObjectFlush={objectFlush.register} onPinItem={pinMediaItem} onActiveRegionChange={activeCaptureRegionChanged} blackboardEnabled={blackboardAvailable()} aiAvailable={agentReady()} onBlackboardReplay={replaySpace} blackboard={isBlackboard(ownedScene())} blackboardDrawing={blackboardEditing()===currentId} onBlackboardClose={finishBlackboard} onOpenBlackboard={blackboardAvailable()?id=>void reopenBlackboard(id):undefined} onRegisterDrawingHistory={registerDrawingHistory} onRasterSnapshot={accept} showButtonLabels={preferences().showButtonLabels} translationLanguage={preferences().translationLanguage} video={{ previewResolution: preferences().videoPreviewResolution, lane: videoLane, onRegisterPause: videoPlayers.register, onRegisterPlayer: videoNavigation.register, onPauseAll: videoPlayers.pauseAll.bind(videoPlayers), onAnnotationEdit: applyVideoAnnotation, onAnnotationTextEdit: applyVideoAnnotationText, drawing: { onApplyDrawing: applyVideoDrawing, onDocument: applyVideoDrawingDocument, onEditText: applyVideoDrawingText, onSnapshot: accept, onReadVector: videoDrawingBridge.getVideoAnnotationVector, onReadText: videoAnnotationBridge.getVideoAnnotationText, onRegisterDrawingAuthoringFlush: videoDrawingFlush.register }, onRegister: videoFlush.register, onEdit: applyVideoEdit, exporting: videoExport(), onCancelExport: cancelVideoExport, onError: showError }} onVideoExport={exportVideoItem} onVideoCopy={copyVideoItem} onCodeSource={acceptCodeSource} codeView={codeView()} codeActionBusy={codeActionBusy()} onCodeAction={codeAction} onRegisterDrawingFlush={drawingFlush.register} onExportActivity={setExportActive} onGeometryReplay={replayGeometry} onPin={createPin} onTranslationRemove={removeTranslation} translationPending={translations().find(value => value.request.target.sceneId === currentId)} translationNotice={translationNotices()[currentId]} onTranslationRequest={startTranslation} onTranslationCancel={() => translationRequests.cancelScene(currentId)} onClearTranslationNotice={() => setTranslationNotices(old => withoutScene(old, currentId))} onScrollCapture={startScroll} pingWheelTrigger={preferences().pingWheelTrigger} pingWheelSlots={preferences().pingWheelSlots} pingWheelMode={preferences().pingWheelMode} plugins={pluginSnapshot().plugins} onPluginWorkflow={runWorkflow} onDrawingCommand={drawingCommand} onDrawingDocumentCommand={drawingDocumentCommand} onImageDrawingCommand={command} onCopyDrawingTable={copyDrawingTable} onOcrRequest={request => plugins.runPluginOcr(request.requestId, request.pluginId, request.revision, request.contributionId, request.target)} onOcrCancel={plugins.cancelPluginOcr} onOcrResult={accept} scene={canvasScene(ownedScene())} refs={ownedRefs()} maskOpacity={preferences().maskOpacity} authoringBusy={busy() || sending()} inputLocked={exitPreparing()} busy={busy() || sending() || exitPreparing()} geometryController={regionGeometry} geometryView={geometryView()} onBeforeExport={flush} onCopyClose={closeScene} onRecordRegion={id => void startRecording(id)} onAddRegion={region => addRegion(currentId, region)} onSelectionActivity={setSelectionActive} onFocusComposer={() => setFocusRequest(v => v + 1)} onSelectionComplete={selectionCompleted} onRemoveRegion={id => removeReferenceObject('region', id)} onReference={toggleReference} onUpdateItem={item => command({ type: 'update_item', sceneId: currentId, item })} onRemoveItem={id => removeReferenceObject('item', id)} onError={showError} />
+        <SpaceCanvas recordingSelection={recordingSelectionSource()?.sceneId===currentId && recordingSelectionSource()?.backgroundId===ownedScene().background?.id} onRegisterObjectFlush={objectFlush.register} onPinItem={pinMediaItem} onActiveRegionChange={activeCaptureRegionChanged} blackboardEnabled={blackboardAvailable()} aiAvailable={agentReady()} onBlackboardReplay={replaySpace} blackboard={isBlackboard(ownedScene())} blackboardDrawing={blackboardEditing()===currentId} onBlackboardClose={finishBlackboard} onOpenBlackboard={blackboardAvailable()?id=>void reopenBlackboard(id):undefined} onRegisterDrawingHistory={registerDrawingHistory} onRasterSnapshot={accept} showButtonLabels={preferences().showButtonLabels} translationLanguage={preferences().translationLanguage} video={{ previewResolution: preferences().videoPreviewResolution, lane: videoLane, onRegisterPause: videoPlayers.register, onRegisterPlayer: videoNavigation.register, onPauseAll: videoPlayers.pauseAll.bind(videoPlayers), onAnnotationEdit: applyVideoAnnotation, onAnnotationTextEdit: applyVideoAnnotationText, drawing: { onApplyDrawing: applyVideoDrawing, onDocument: applyVideoDrawingDocument, onEditText: applyVideoDrawingText, onSnapshot: accept, onReadVector: videoDrawingBridge.getVideoAnnotationVector, onReadText: videoAnnotationBridge.getVideoAnnotationText, onRegisterDrawingAuthoringFlush: videoDrawingFlush.register }, onRegister: videoFlush.register, onEdit: applyVideoEdit, exporting: videoExport(), onCancelExport: cancelVideoExport, onError: showError }} onVideoExport={exportVideoItem} onVideoCopy={copyVideoItem} onCodeSource={acceptCodeSource} codeView={codeView()} codeActionBusy={codeActionBusy()} onCodeAction={codeAction} onRegisterDrawingFlush={drawingFlush.register} onExportActivity={setExportActive} onGeometryReplay={replayGeometry} onPin={createPin} onTranslationRemove={removeTranslation} translationPending={translations().find(value => value.request.target.sceneId === currentId)} translationNotice={translationNotices()[currentId]} onTranslationRequest={startTranslation} onTranslationCancel={() => translationRequests.cancelScene(currentId)} onClearTranslationNotice={() => setTranslationNotices(old => withoutScene(old, currentId))} onScrollCapture={startScroll} pingWheelTrigger={preferences().pingWheelTrigger} pingWheelSlots={preferences().pingWheelSlots} pingWheelMode={preferences().pingWheelMode} plugins={pluginSnapshot().plugins} onPluginWorkflow={runWorkflow} onDrawingCommand={drawingCommand} onDrawingDocumentCommand={drawingDocumentCommand} onImageDrawingCommand={command} onCopyDrawingTable={copyDrawingTable} onOcrRequest={request => plugins.runPluginOcr(request.requestId, request.pluginId, request.revision, request.contributionId, request.target)} onOcrCancel={plugins.cancelPluginOcr} onOcrResult={accept} scene={canvasScene(ownedScene())} refs={ownedRefs()} maskOpacity={preferences().maskOpacity} authoringBusy={busy() || sending()} inputLocked={exitPreparing() || Boolean(recording() || scroll())} busy={busy() || sending() || exitPreparing() || Boolean(recording() || scroll())} geometryController={regionGeometry} geometryView={geometryView()} onBeforeExport={flush} onCopyClose={closeScene} onRecordRegion={id => void startRecording(id)} onAddRegion={region => addRegion(currentId, region)} onSelectionActivity={setSelectionActive} onFocusComposer={() => setFocusRequest(v => v + 1)} onSelectionComplete={selectionCompleted} onRemoveRegion={id => removeReferenceObject('region', id)} onReference={toggleReference} onUpdateItem={item => command({ type: 'update_item', sceneId: currentId, item })} onRemoveItem={id => removeReferenceObject('item', id)} onError={showError} />
         <Show when={blackboardEditing()!==currentId}><PinObjectLayer exiting={exitPreparing()} aiAvailable={agentAvailable()} objects={pinObjects()} busy={busy()||sending()||exitPreparing()} referenced={pinReferenced} onReference={object=>void referencePin(object)} onError={showError}/></Show>
         <Show when={blackboardEditing()!==currentId}><nav class="space-utilities" aria-label={t('空间操作')}>
           <button class="icon-button" aria-label={t('退出')} title={t('退出')} disabled={busy()||exitPreparing()} onClick={()=>void closeScene(currentId)}><X size={17}/></button>
@@ -1276,6 +1498,7 @@ export default function App() {
           <span class="space-utility-divider"/>
           <button class="icon-button" aria-label={t('撤销')} title={t('撤销 · Ctrl+Z')} disabled={busy()||sending()||exitPreparing()||ownedScene().run?.status==='running'||!canReplaySpace(false)} onClick={()=>replaySpace(false)}><Undo2 size={17}/></button>
           <button class="icon-button" aria-label={t('重做')} title={t('重做 · Ctrl+Shift+Z')} disabled={busy()||sending()||exitPreparing()||ownedScene().run?.status==='running'||!canReplaySpace(true)} onClick={()=>replaySpace(true)}><Redo2 size={17}/></button>
+          <ExtensionSurfaces sceneId={currentId} disabled={busy()||sending()||exitPreparing()||Boolean(recording()||scroll())||ownedScene().closed||ownedScene().frozen||ownedScene().run?.status==='running'} onBeforeSave={flush} onError={showError}/>
           <ExtensionSpaceCommands sceneId={currentId} disabled={busy()||sending()||exitPreparing()||selectionActive()||exportActive()||Boolean(recording()||scroll())||ownedScene().closed||ownedScene().frozen||ownedScene().run?.status==='running'} onError={showError}/>
         </nav>
         <Show when={agentAvailable()}><Composer ready={agentReady()} onReferenceInserted={referenceInserted} referenceInsertion={referenceInsertion()} alwaysVisible={preferences().composerAlwaysVisible} showButtonLabels={preferences().showButtonLabels} thinkingGlowEnabled={preferences().thinkingGlowEnabled} thinkingGlowColor={preferences().thinkingGlowColor} onVideoAnswer={action => void jumpToVideoAnswer(action)} onContinueJournal={continueJournal} voice={voiceControl()} onComposition={active => { if (scene()?.id !== currentId) return; voiceComposing = active; if (!active) voice.compositionEnded(); }} scene={ownedScene()} agents={snapshot()!.agents} connections={snapshot()!.connections.filter(value=>capabilities()?.configuredConnectionIds.includes(value.id))} draft={ownedDraft()} refs={ownedRefs()} stream={streams()[currentId]} error={sendErrors()[currentId]} expanded={expanded()[currentId] ?? false} position={composerPositions()[currentId] ?? rememberedComposerPosition()} onPosition={value => { setComposerPositions(old => ({ ...old, [currentId]: value })); setRememberedComposerPosition(value ?? undefined); try { if (value) localStorage.setItem(composerPositionStorageKey, JSON.stringify(value)); else localStorage.removeItem(composerPositionStorageKey); } catch { /* 存储不可用时忽略 */ } }} selectionActive={selectionActive()} focusRequest={focusRequest()} sending={sending()} closing={Boolean(closingScene())} onDraft={setDraft} onSend={() => void send()} onCancel={() => void cancel()} onImport={() => void importFiles()} onFreeze={() => void freeze()} onClose={() => void closeScene(currentId)} onNew={() => void newConversation()} onCapture={() => void capture()} onSessions={() => setSessionsOpen(true)} onFocusRef={focusReference} onRemoveRef={toggleReference} onExpanded={value => setExpanded(old => ({ ...old, [currentId]: value }))} onAgent={agentId => void command({ type: 'set_agent', sceneId: currentId, agentId }).catch(showError)} onSelectConnection={connectionId => void command({ type: 'set_scene_connection', sceneId: currentId, connectionId }).catch(showError)} onConnection={() => void openConnection()} onError={showError} /></Show></Show>
@@ -1285,6 +1508,8 @@ export default function App() {
     <Show when={settings() && snapshot()}><div class="settings-surface settings-surface-overlay"><SettingsDialog snapshot={snapshot()!} initialTab={settings()!} preferences={preferences()} hotkey={hotkey()} onPreferences={changePreferences} onSaveAgent={saveAgent} onSaveMemory={value => command({ type: 'save_memory', ...value })} onDeleteMemory={value => command({ type: 'delete_memory', ...value })} onSaveConnectionProfile={saveConnectionProfile} onDeleteConnectionProfile={deleteConnectionProfile} onSetDefaultConnection={connectionId => command({ type: 'set_default_connection', connectionId })} onDiscoverMcpServer={discoverMcpServer} onMcpCommand={command} onClose={() => setSettings(undefined)} /></div></Show>
     <Show when={!exitPreparing() && pendingDrawingDrafts().length}><DrawingDraftsDialog entries={pendingDrawingDrafts()} onDiscard={discardDrawingDraft} onClose={() => setPendingDrawingDrafts([])} /></Show>
     <Show when={error() && snapshot()}><div class="toast" role="alert"><CircleAlert size={15} /><span>{error()}</span><button class="icon-button compact" aria-label={t("关闭提示")} onClick={() => setError('')}><X size={13} /></button></div></Show>
-    </Show>
+    </div>
+    <Show when={capturePresentationLive() && (recording()?.retainMain === true || recording()?.hud?.stage !== 'live') && recording()}>{status => <RecordingBackdrop status={status()} maskOpacity={preferences().maskOpacity} />}</Show>
+    <Show when={capturePresentationLive() && (!scroll()?.hud?.live || scroll()?.hud?.retainMain === true) && scroll()}>{status => <ScrollBackdrop status={status()} maskOpacity={preferences().maskOpacity} />}</Show>
   </div>;
 }

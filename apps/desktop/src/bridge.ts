@@ -16,8 +16,22 @@ import { bundledProviderPresets } from './provider-presets';
 import type { CaptureBackgroundReady } from './capture-presentation';
 import * as capturePerformance from './capture-performance';
 import { startDrawingDiagnostics } from './drawing-diagnostics';
+import type { AppControlCompletion } from './app-control';
+import type { ScrollStatus } from './scroll-bridge';
 
 export const native = isTauri();
+export async function registerControlRenderer(): Promise<{ rendererId: string }> {
+  if (!native) throw new Error('此操作需要桌面应用');
+  return invoke('register_control_renderer');
+}
+export async function claimControlRequest(rendererId: string, id: string, nonce: string): Promise<void> {
+  if (!native) throw new Error('此操作需要桌面应用');
+  await invoke('claim_control_request', { rendererId, id, nonce });
+}
+export async function completeControlRequest(rendererId: string, completion: AppControlCompletion): Promise<void> {
+  if (!native) throw new Error('此操作需要桌面应用');
+  await invoke('complete_control_request', { rendererId, ...completion });
+}
 export async function captureBackgroundReady(ready: CaptureBackgroundReady): Promise<boolean> {
   if (!native) return false;
   return invoke<boolean>('capture_background_ready', { ...ready });
@@ -50,6 +64,8 @@ export interface RecordingStatus {
   rect: { x: number; y: number; width: number; height: number };
   stopHotkey: string;
   audio: RecordingAudioMode;
+  retainMain?: boolean;
+  hud?: { rect: RecordingStatus['rect'] | null; stage: 'layout' | 'mask' | 'live' };
 }
 export type RecordingAction = 'pause' | 'resume' | 'stop' | 'cancel';
 interface RuntimeInfo { platform: 'windows' | 'macos' | 'linux' | 'other'; hotkey: string; captureBackend: string; contentOrigin: string; measureInteractions?: boolean }
@@ -281,20 +297,41 @@ export async function controlRecording(id: string, action: RecordingAction): Pro
   if (!native) throw new Error('仅桌面版可录屏');
   return invoke('control_recording', { id, action });
 }
+export async function getRecordingStatus(): Promise<RecordingStatus | null> {
+  if (!native) throw new Error('仅桌面版可录屏');
+  return invoke('get_recording_status');
+}
+export async function getScrollStatus(): Promise<ScrollStatus | null> {
+  if (!native) throw new Error('请在桌面版使用长截图');
+  return invoke('get_scroll_status');
+}
+export async function recordingSurfaceReady(id: string, stage: 'layout' | 'mask'): Promise<boolean> {
+  if (!native) return false;
+  return invoke<boolean>('recording_surface_ready', { id, stage });
+}
 export async function subscribeRecording(onStatus: (status: RecordingStatus | null) => void, surface: 'space' | 'recording-controls' = 'space'): Promise<() => void> {
   if (!native) { onStatus(null); return () => undefined; }
-  let serial = 0, current: RecordingStatus | null = null, stopped = false;
+  let serial = 0, current: RecordingStatus | null = null, stopped = false, countdownSeen = false;
   const finishedIds = new Set<string>();
   const accept = (next: RecordingStatus | null) => {
     if (stopped || (next && finishedIds.has(next.id))) return;
     if (next && current?.id === next.id) {
+      if (current.retainMain === true && next.retainMain !== true) return;
+      if (current.phase === 'countdown' && current.retainMain === false && !current.hud &&
+        next.phase === 'starting' && !next.hud && next.retainMain !== true) return;
+      const hudStage = { layout: 0, mask: 1, live: 2 };
+      if (current.hud && (!next.hud || hudStage[next.hud.stage] < hudStage[current.hud.stage])) return;
+      if (current.hud && current.phase === 'countdown' && next.phase === 'starting' && next.hud?.stage === 'layout') return;
       if (current.phase === 'stopping' && next.phase !== 'stopping') return;
-      if (current.phase !== 'countdown' && next.phase === 'countdown') return;
+      if (current.phase !== 'countdown' && next.phase === 'countdown' && !(!countdownSeen && current.phase === 'starting' && current.countdown === 0 && current.elapsedMs === 0 && next.countdown > 0 &&
+        ((!current.hud && !next.hud) || (current.hud?.stage === 'layout' && next.hud?.stage === 'layout')))) return;
       if (['recording', 'paused', 'stopping'].includes(current.phase) && next.phase === 'starting') return;
       if (next.elapsedMs < current.elapsedMs) return;
       if (current.phase === 'countdown' && next.phase === 'countdown' && next.countdown > current.countdown) return;
     }
     if (current && current.id !== next?.id) finishedIds.add(current.id);
+    if (current?.id !== next?.id) countdownSeen = false;
+    if (next?.phase === 'countdown') countdownSeen = true;
     current = next; onStatus(next);
   };
   const unlisten = await listen<RecordingStatus | null>('recording-status', event => { serial++; accept(event.payload); }, { target: surface });
@@ -645,8 +682,9 @@ function pickFiles(): Promise<File[]> {
   });
 }
 
-export async function importAssets(sceneId: string): Promise<Snapshot> {
-  if (native) return invokeSnapshot('import_assets', { sceneId });
+export async function importAssets(sceneId: string, paths?: string[]): Promise<Snapshot> {
+  if (native) return invokeSnapshot('import_assets', { sceneId, ...(paths === undefined ? {} : { paths }) });
+  if (paths !== undefined) throw new Error('本机路径导入需要桌面应用');
   const initial = findScene(sceneId);
   const owner = { agentId: initial.agentId, background: JSON.stringify(initial.background ?? null) };
   const checkScene = () => {
@@ -754,6 +792,12 @@ export async function hideSpace(): Promise<void> {
 }
 export async function openSettings(): Promise<void> {
   if (native) return invoke('open_settings');
+}
+export async function exportControlImage(sceneId: string, regionId: string, path: string, variant: ImageExportVariant): Promise<{ path: string; width?: number; height?: number }> {
+  if (!native) throw new Error('图片导出需要桌面应用');
+  const result = await invoke<{ path: string; width?: number; height?: number }>('export_control_image', { sceneId, regionId, path, variant });
+  if (!result || typeof result.path !== 'string' || !result.path) throw new Error('图片导出回执无效');
+  return result;
 }
 export async function closeSceneWindow(sceneId: string): Promise<Snapshot> {
   if (native) return invokeSnapshot('close_scene_window', { sceneId });

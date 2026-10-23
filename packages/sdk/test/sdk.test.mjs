@@ -19,6 +19,71 @@ function harness(dispatch) {
   });
   return { scope, calls };
 }
+
+test('plugin-owned toolbox uses only atomic object API; host has no folder or slot operations', async () => {
+  const {default:activate}=await import('../../../extensions/official/object-toolbox/index.mjs');
+  let value={revision:0,state:null,objects:{}};
+  const {scope,calls}=harness(async(method,params)=>{
+    if(method==='objects.library.describe')return {version:1,capabilities:['ui.surfaces','ui.objects','objects.library','objects.preview']};
+    if(method==='objects.library.get')return structuredClone(value);
+    if(method==='objects.library.commit'){
+      assert.equal(params.expectedRevision,value.revision);
+      value={revision:value.revision+1,state:params.state,objects:{...value.objects}};
+      for(const id of params.remove||[])delete value.objects[id];
+      if(params.captureKey)value.objects[params.captureKey]={name:'选区.png',kind:'image'};
+      return structuredClone(value);
+    }
+    throw Error('unsupported');
+  });
+  await activate(scope.ctx);
+  assert.deepEqual(JSON.parse(scope.finishRegistration())[0].metadata,{surface:'space-overlay'});
+  assert.equal((await invoke(scope,'toolbox',{type:'mount'})).ok,true);
+  assert.equal(calls.length,1,'mount returns package HTML without touching native state');
+  for(let i=0;i<2;i++)assert.equal((await invoke(scope,'toolbox',{type:'drop',target:'root/0'})).ok,true);
+  assert.equal(value.state.slots[0].children.length,2);
+  assert.ok(calls.every(call=>['objects.library.describe','objects.library.get','objects.library.commit'].includes(call.method)));
+  assert.equal((await invoke(scope,'toolbox',{type:'remove',id:'folder-2'})).ok,true);
+  assert.deepEqual(value.objects,{});
+  await scope.deactivate();await assert.rejects(scope.ctx.objects.get(),/closed/);
+});
+test('independent notes owns a different state and layout with the same host contract',async()=>{
+  const {default:activate}=await import('../../../extensions/examples/research-notes/index.mjs');
+  let value={revision:0,state:null,objects:{}};
+  const {scope}=harness(async(method,params)=>{
+    if(method==='objects.library.describe')return {version:1,capabilities:['ui.surfaces','ui.objects','objects.library','objects.preview']};
+    if(method==='objects.library.get')return structuredClone(value);
+    if(method==='objects.library.commit'){value={revision:value.revision+1,state:params.state,objects:{}};return value;}
+    throw Error('revoked');
+  });
+  await activate(scope.ctx);scope.finishRegistration();
+  assert.ok((await invoke(scope,'notes',{type:'mount'})).result.html.includes('textarea'));
+  assert.equal((await invoke(scope,'notes',{type:'save',text:'研究进度'})).ok,true);
+  assert.equal(value.state.text,'研究进度');
+  assert.equal((await invoke(scope,'notes',{type:'restore',id:'foreign',x:.2,y:.3})).ok,false);
+  await scope.deactivate();
+});
+test('toolbox preview resolves its owned key and invokes the published thumbnail API',async()=>{
+  const {default:activate}=await import('../../../extensions/official/object-toolbox/index.mjs');
+  const {scope,calls}=harness(async(method,params)=>{
+    if(method==='objects.library.describe')return {capabilities:['objects.preview']};
+    if(method==='objects.library.get')return {revision:5,state:{slots:[{id:'entry',key:'owned'}]},objects:{owned:{name:'picture.png'}}};
+    if(method==='objects.library.preview'){assert.deepEqual(params,{expectedRevision:5,id:'owned'});return {image:'data:image/png;base64,example'};}
+    throw Error('unexpected method');
+  });
+  await activate(scope.ctx);scope.finishRegistration();
+  const result=await invoke(scope,'toolbox',{type:'preview',id:'entry'});
+  assert.equal(result.ok,true);assert.equal(result.result.image,'data:image/png;base64,example');
+  assert.equal((await invoke(scope,'toolbox',{type:'preview',id:'foreign'})).ok,false);
+  assert.equal(calls.filter(c=>c.method==='objects.library.preview').length,1);
+  await scope.deactivate();
+});
+test('native refusal remains a failed plugin invocation, never fabricated success',async()=>{
+  const {default:activate}=await import('../../../extensions/official/object-toolbox/index.mjs');
+  const {scope}=harness(async method=>{if(method==='objects.library.describe')return {version:1,capabilities:['ui.surfaces','ui.objects','objects.library','objects.preview']};throw Error('revoked');});
+  await activate(scope.ctx);scope.finishRegistration();
+  assert.equal((await invoke(scope,'toolbox',{type:'drop',target:'root/0'})).ok,false);
+  await scope.deactivate();
+});
 async function invoke(scope, id, input, context = {}) {
   scope.invoke(id, JSON.stringify(input), JSON.stringify(context));
   for (let i = 0; i < 200; i++) {

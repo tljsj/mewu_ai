@@ -5,12 +5,15 @@ export type JsonObject = { [key: string]: JsonValue };
 export type Dispose = () => void;
 export type ServiceKind = 'command' | 'tool' | 'agent' | 'memory' | 'model' | 'channel' | 'renderer' | 'ui' | 'service';
 export type PluginPlatform = 'any' | 'windows-x86_64' | 'darwin-aarch64' | 'linux-x86_64';
+/** SVG paths in a 24×24 viewBox. No markup, URLs, scripts or external assets. */
+export interface ExtensionIcon { paths: string[]; color?: string; filled?: boolean }
 export interface ExtensionManifest {
   schemaVersion: 2;
   id: string;
   version: string;
   name: string;
   description: string;
+  icon?: ExtensionIcon;
   publisher?: string;
   license: string;
   hostApi: 2;
@@ -87,9 +90,15 @@ export interface RenderedObject {
   height: number;
 }
 export interface ExtensionContext {
+  readonly runtime: { describe(): Promise<{ hostApi: 2; capabilities: string[] }> };
   readonly hostApi: 2;
   readonly host: HostBridge;
   readonly storage: ExtensionStorage;
+  /** Shared plugin configuration. Writes require a live settings surface. */
+  readonly configuration: {
+    get(key: string): Promise<JsonValue>;
+    compareAndSet(key: string, expected: JsonValue, value: JsonValue): Promise<boolean>;
+  };
   readonly commands: ServiceRegistry;
   readonly tools: ServiceRegistry;
   readonly agents: ServiceRegistry;
@@ -98,7 +107,25 @@ export interface ExtensionContext {
   readonly channels: ServiceRegistry;
   readonly renderers: ServiceRegistry;
   readonly ui: ServiceRegistry & { render(value: RenderedObject): Promise<JsonValue> };
+  /** Atomic, plugin-owned JSON state and retained native objects. Only a live
+   * UI surface has access. captureKey consumes one actual user drop. */
+  readonly objects: {
+    describe(): Promise<{version: 1; capabilities: string[]}>;
+    get(): Promise<{revision: number; state: JsonValue; objects: Record<string, JsonValue>}>;
+    preview(expectedRevision:number,id:string): Promise<{image:string|null}>;
+    commit(value: {expectedRevision:number;state:JsonValue;remove?:string[];captureKey?:string}): Promise<JsonValue>;
+    restore(expectedRevision:number,id:string,position:{x:number;y:number}): Promise<JsonValue>;
+  };
   readonly model: { invoke(request: ModelRequest): Promise<ModelReply> };
+  /** Requires process.rpc. Fixed local executables only, no shell/installer.
+   * Processes stop on invocation completion, cancellation or revocation. */
+  readonly processes: {
+    resolve(candidates: string[], files?: string[]): Promise<{ platform: string; executables: string[]; files: string[] }>;
+    open(command: { executable: string; args: string[]; cwd?: string; env?: Record<string,string> }): Promise<{ id: string; cwd: string }>;
+    write(id: string, message: JsonObject, bindings?: { frameId: string; pointer: string; encoding: 'base64' | 'dataUrl' }[]): Promise<JsonValue>;
+    read(id: string, timeoutMs?: number): Promise<JsonObject | null>;
+    close(id: string): Promise<JsonValue>;
+  };
   readonly region: {
     observe(regionId: string): Promise<RegionObservation>;
     action(regionId: string, action: RegionAction): Promise<JsonValue>;

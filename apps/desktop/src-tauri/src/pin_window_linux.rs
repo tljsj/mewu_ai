@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
-//! Independent GTK pins on an existing local X11/XWayland screen. The capture
-//! Space keeps its original display and Wayland portal; no process-wide backend
-//! or display default is changed. All GTK objects stay on the UI thread.
+//! Independent GTK pins share the application's X11/XWayland display. Screen
+//! acquisition still follows the compositor session's Portal permissions.
 use super::{PinRegistry, Rect};
 use gtk::prelude::*;
 use std::{
@@ -40,6 +39,25 @@ fn local_display_name(value: &str) -> bool {
 }
 
 pub(super) fn prepare(window: &WebviewWindow) -> Result<(), String> {
+    prepare_floating(window)?;
+    bind_space(window.app_handle())?;
+    Ok(())
+}
+/// Never move WebKit to a second GdkDisplay: its cursor cache is process-global.
+pub(super) fn build_floating<T>(
+    app:&AppHandle,
+    build:impl FnOnce(&AppHandle)->Result<T,String>,
+) -> Result<T,String> {
+    if !gtk::is_initialized_main_thread(){return Err("浮动对象只能在界面线程创建".into());}
+    let space=app.get_webview_window("space").ok_or("截图窗口不可用")?;
+    let widget=space.gtk_window().map_err(|_|"截图窗口不可用")?;
+    if widget.display().type_().name()=="GdkX11Display"
+        && gtk::gdk::Display::default().is_some_and(|default|default==widget.display()) {
+        return build(app);
+    }
+    Err("当前桌面没有可用的 XWayland 浮动对象服务".into())
+}
+pub(crate) fn prepare_floating(window: &WebviewWindow) -> Result<(), String> {
     if !gtk::is_initialized_main_thread() {
         return Err("贴图窗口只能在界面线程操作".into());
     }
@@ -48,41 +66,17 @@ pub(super) fn prepare(window: &WebviewWindow) -> Result<(), String> {
         return Err("贴图初始化状态无效".into());
     }
     let display = widget.display();
-    if display.type_().name() != "GdkX11Display" {
-        let name = std::env::var("DISPLAY").map_err(|_| "当前桌面没有可用的原位贴图服务")?;
-        if !local_display_name(&name) {
-            return Err("原位贴图需要本机显示服务".into());
-        }
-        let manager = gtk::gdk::DisplayManager::get();
-        let x11 = manager
-            .list_displays()
-            .into_iter()
-            .find(|d| !d.is_closed() && d.type_().name() == "GdkX11Display" && d.name() == name)
-            .or_else(|| gtk::gdk::Display::open(&name))
-            .ok_or("无法连接原位贴图服务")?;
-        if x11.is_closed() || x11.type_().name() != "GdkX11Display" {
-            return Err("原位贴图服务不可用".into());
-        }
-        // Gtk.Window.set_screen supports a different GdkScreen. Only this new,
-        // hidden pin is migrated; the Space/window action witness is untouched.
-        if widget.is_realized() {
-            widget.unrealize();
-        }
-        let screen = x11.default_screen();
-        widget.set_screen(&screen);
-        widget.set_visual(screen.rgba_visual().as_ref());
-        if widget.display() != x11 {
-            return Err("原位贴图窗口未能关联显示服务".into());
-        }
+    if display.is_closed()||display.type_().name()!="GdkX11Display"
+        || gtk::gdk::Display::default().is_none_or(|default|default!=display) {
+        return Err("浮动对象必须先在本机显示服务创建".into());
     }
+    if !widget.is_realized(){widget.set_visual(display.default_screen().rgba_visual().as_ref());}
     widget.set_focus_on_map(false);
     widget.set_accept_focus(true);
-    // These builder hints were first applied to the former Wayland drawable.
-    // Reapply them to the pin's actual X11 screen before its first native map.
+    // Apply native hints before the first map, on the original display.
     widget.set_keep_above(true);
     widget.set_skip_taskbar_hint(true);
     widget.set_skip_pager_hint(true);
-    bind_space(window.app_handle())?;
     Ok(())
 }
 
